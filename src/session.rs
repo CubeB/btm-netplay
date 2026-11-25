@@ -42,6 +42,7 @@ use crate::types::{Endpoint, Instant, Outgoing, PlayerId};
 mod codec;
 mod guest;
 mod host;
+pub mod rejoin;
 mod sha256;
 
 pub use codec::DecodeError;

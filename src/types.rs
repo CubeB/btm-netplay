@@ -33,4 +33,18 @@ pub trait Engine {
     fn state_hash(&self) -> u32;
     /// A dump of the state for a desync report.
     fn dump(&self) -> String;
+
+    /// Prepare a new game before its first tick. The driver ([`crate::io::Node`]) calls it
+    /// once the lobby is over (or a returning player's catch-up has arrived), with the
+    /// agreed simulation seed, starting on the pump after the one that reported the
+    /// game's setup (`io::Event::Loading`, and `Node::game_start`). It keeps calling it,
+    /// once per pump, until it returns `true`; until then this peer tells the others it is
+    /// still loading (SPEC 3.7). A returning player fast-forwards from the loaded state.
+    ///
+    /// The default returns `true` at once and changes nothing, for an engine that is set
+    /// up by other means. Added for rejoin; the only change to this trait.
+    fn load(&mut self, seed: u64) -> bool {
+        let _ = seed;
+        true
+    }
 }

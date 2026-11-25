@@ -1,7 +1,7 @@
 //! A host and two guests on real localhost UDP sockets, in one process, from the lobby
 //! through the load handshake to 300 ticks of lockstep with identical hashes: directly,
 //! with every datagram going through an in-process relay, and mixed (one guest direct, one
-//! that can only use the relay).
+//! that can only use the relay). And a guest that drops out and rejoins.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -18,13 +18,13 @@ use btm_netplay::types::{Endpoint, Instant, Outgoing, PlayerId, Tick};
 
 const TICKS: u32 = 300;
 
-fn config(name: &str) -> NodeConfig {
+fn config(name: &str, drop_timeout: Duration) -> NodeConfig {
     let mut c = NodeConfig::new(name);
     c.bind_ip = Ipv4Addr::LOCALHOST;
     c.discovery_port = 0;
     c.game_port = 0;
     c.stun = Stun::Off;
-    c.drop_timeout = Duration::from_secs(30);
+    c.drop_timeout = drop_timeout;
     c
 }
 
@@ -165,10 +165,8 @@ impl Peer {
     }
 
     fn pump(&mut self) {
+        // The node loads the engine with the agreed seed itself (Engine::load).
         for e in self.node.pump(&mut self.engine) {
-            if let Event::Loading { seed, .. } = &e {
-                self.engine = ToyEngine::new(*seed);
-            }
             if let Event::Ended(why) = &e {
                 panic!("{} ended: {why}\nlog:\n{}", self.name, self.log.join("\n"));
             }
@@ -206,6 +204,9 @@ struct Guest {
 struct Game {
     relay: Option<Relay>,
     peers: Vec<Peer>,
+    /// What each guest typed to join, in guest order.
+    targets: Vec<String>,
+    drop_timeout: Duration,
     started: bool,
     deadline: StdInstant,
     /// Before pressing start, also wait until host and guest 1 have punched each other.
@@ -213,9 +214,9 @@ struct Game {
 }
 
 impl Game {
-    fn new(relay: bool, guests: &[Guest]) -> Self {
+    fn new(relay: bool, guests: &[Guest], drop_timeout: Duration) -> Self {
         let mut relay = relay.then(Relay::new);
-        let mut host_cfg = config("Host");
+        let mut host_cfg = config("Host", drop_timeout);
         if let Some(r) = &relay {
             host_cfg.relay = Some(r.addr());
             host_cfg.relay_always = true;
@@ -241,17 +242,22 @@ impl Game {
             std::thread::sleep(Duration::from_millis(2));
         });
         let mut peers = vec![host];
+        let mut targets = Vec::new();
         for (i, g) in guests.iter().enumerate() {
             let target = match g.via {
                 Via::Address => disc.to_string(),
                 Via::RelayCode => code.clone().unwrap(),
             };
-            let n = node(config(g.name), Role::Join(target), g.relay_only);
+            let cfg = config(g.name, drop_timeout);
+            let n = node(cfg, Role::Join(target.clone()), g.relay_only);
             peers.push(Peer::new(g.name, n, 2 + i as u64));
+            targets.push(target);
         }
         Self {
             relay,
             peers,
+            targets,
+            drop_timeout,
             started: false,
             deadline,
             wait_direct: false,
@@ -341,7 +347,7 @@ fn play(relay: bool) {
             relay_only: false,
         },
     ];
-    let mut game = Game::new(relay, &guests);
+    let mut game = Game::new(relay, &guests, Duration::from_secs(30));
     game.run_until(all_reached(TICKS));
     game.assert_same_hashes(TICKS);
     // Commands really flowed from every player.
@@ -390,7 +396,7 @@ fn a_direct_and_a_relay_only_guest_play_300_ticks() {
             relay_only: true,
         },
     ];
-    let mut game = Game::new(true, &guests);
+    let mut game = Game::new(true, &guests, Duration::from_secs(30));
     game.wait_direct = true;
     game.run_until(all_reached(TICKS));
     game.assert_same_hashes(TICKS);
@@ -424,4 +430,49 @@ fn a_direct_and_a_relay_only_guest_play_300_ticks() {
     let r = game.relay.as_ref().unwrap();
     assert!(r.server.stats().forwarded > 500, "{:?}", r.server.stats());
     assert!(game.peers[1].node.transport().relay_link().is_some());
+}
+
+#[test]
+fn a_dropped_guest_rejoins_with_the_same_address_and_catches_up() {
+    let guests = [
+        Guest {
+            name: "Guest1",
+            via: Via::Address,
+            relay_only: false,
+        },
+        Guest {
+            name: "Guest2",
+            via: Via::Address,
+            relay_only: false,
+        },
+    ];
+    let mut game = Game::new(false, &guests, Duration::from_secs(2));
+    game.run_until(all_reached(100));
+    // Guest 2's machine goes away: node, sockets and engine.
+    drop(game.peers.remove(2));
+    let cfg = config("Guest2", game.drop_timeout);
+    let again = node(cfg, Role::Join(game.targets[1].clone()), false);
+    game.peers.push(Peer::new("Guest2 again", again, 99));
+    game.run_until(all_reached(400));
+    game.assert_same_hashes(400);
+    let log = |i: usize| {
+        game.peers[i].log.join(
+            "
+",
+        )
+    };
+    assert!(log(0).contains("Guest2 has left the game"), "{}", log(0));
+    assert!(
+        log(0).contains("Guest2 has rejoined the game"),
+        "{}",
+        log(0)
+    );
+    assert!(
+        log(1).contains("Guest2 has rejoined the game"),
+        "{}",
+        log(1)
+    );
+    assert!(log(2).contains("Rejoined the game"), "{}", log(2));
+    // The returning player's commands count again after the rejoin.
+    assert!(game.peers[2].engine.commands_seen() > 50);
 }

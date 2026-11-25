@@ -120,6 +120,12 @@ impl Engine for ToyEngine {
         }
     }
 
+    /// A fresh state from the seed; a chosen corrupt tick is kept.
+    fn load(&mut self, seed: u64) -> bool {
+        *self = Self::new(seed).corrupt_at(self.corrupt_at);
+        true
+    }
+
     fn dump(&self) -> String {
         let words: Vec<String> = self.state.iter().map(u32::to_string).collect();
         format!(

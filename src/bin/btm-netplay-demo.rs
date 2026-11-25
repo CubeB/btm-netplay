@@ -233,7 +233,8 @@ fn run(args: Args) -> Result<(), String> {
         }
     });
 
-    let mut engine = ToyEngine::default();
+    // The node loads it with the agreed seed (Engine::load) when the game starts.
+    let mut engine = ToyEngine::default().corrupt_at(args.desync_at.map(Tick));
     let mut rng = Rng::from_entropy();
     let mut next_cmd = 1u32;
     let mut last_status = StdInstant::now();
@@ -264,10 +265,6 @@ fn run(args: Args) -> Result<(), String> {
 
         for e in node.pump(&mut engine) {
             match &e {
-                Event::Loading { seed, .. } => {
-                    engine = ToyEngine::new(*seed).corrupt_at(args.desync_at.map(Tick));
-                    println!("{e}");
-                }
                 Event::Ended(Ended::Desync(d)) => {
                     let path = write_dump(d, &build);
                     eprintln!("{}", d.report(path.as_deref()));

@@ -32,6 +32,7 @@ target/release/btm-netplay-demo join BTM-XXXX-XXXX-XXXXX --name B
 - A types `/start`. Every second, each side prints the tick, the round trip, the input delay, stalls, and who is being waited for. Lines typed on stdin are sent as chat.
 - **On one LAN:** use `--no-stun` and `join <ip>`. `btm-netplay-demo lan` lists the games it finds.
 - **If punching fails** (symmetric NAT): run `btm-relay --bind 0.0.0.0:PORT` somewhere reachable, pass `--relay ip:port` to the host, and the host shows a relay code instead. See `RELAY.md`.
+- **Rejoining:** a guest whose game dropped it runs the same `join` again. The host offers the seat back, sends the game so far, and the guest fast-forwards and plays on.
 - **Testing the failure paths:**
   - `--ticks N` ends the game after N ticks.
   - `--build-id X` triggers the mismatch refusal.
@@ -41,5 +42,4 @@ target/release/btm-netplay-demo join BTM-XXXX-XXXX-XXXXX --name B
 
 Work in progress. Not yet wired into an engine. Known gaps:
 
-- rejoin isn't driven by the socket layer yet;
 - IPv6 isn't supported.

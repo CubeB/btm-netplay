@@ -25,6 +25,19 @@
 //! Every user-visible message of SPEC section 9 comes out as an [`Event`] whose
 //! [`fmt::Display`] is the sentence to show.
 //!
+//! # Loading and rejoining
+//!
+//! Once the lobby is over the node reports [`Event::Loading`] and, from the next pump on,
+//! calls [`Engine::load`] with the agreed seed until it returns `true`; only then does it
+//! tell the others it is ready (3.7).
+//!
+//! The host keeps its discovery socket open during the game and serves rejoins
+//! ([`crate::session::rejoin`]). A dropped player runs the same join again; the host
+//! answers its lobby traffic with "in game", the node asks for the seat of its name back,
+//! and the host, once the lockstep has dropped that player, offers the seat at a rejoin
+//! tick R and later sends the game so far. The returning node loads the engine and
+//! fast-forwards (`Lockstep::rejoin`) without a load handshake, then plays on.
+//!
 //! # The transport seam, and the relay
 //!
 //! All socket access goes through the [`Transport`] trait. [`UdpTransport`] is the direct
@@ -82,6 +95,9 @@ use crate::nat::stun;
 use crate::nat::traversal::{Status, Traversal, TraversalEvent, TraversalFailure, Tx};
 use crate::relay::code::{self as relay_code, AnyInvite, RelayInvite, RelayRef};
 use crate::relay::{peer_endpoint, FallbackPolicy, FallbackReason, RelayEvent, RelayLink, RoomId};
+use crate::session::rejoin::{
+    self, ClientEvent, Rejoin, RejoinClient, RejoinRefused, RejoinServer, ServerEvent,
+};
 use crate::session::{
     self, build_compatible, display_build, GameStart, GuestConfig, GuestEvent, GuestLobby,
     GuestStatus, HeardGame, HostConfig, HostError, HostEvent, HostLobby, JoinError, LobbyView,
@@ -488,6 +504,26 @@ enum Lobby {
     Host(Box<HostLobby>),
     Guest(Box<GuestLobby>),
     Browse(Box<Browser>),
+    /// A dropped player asking the host for its seat back (session::rejoin).
+    Rejoin(Box<RejoinClient>),
+}
+
+/// Where the engine is with [`Engine::load`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineLoad {
+    Idle,
+    /// The setup was reported; load from the next pump on.
+    Announced(u64),
+    Loading(u64),
+    Loaded,
+}
+
+/// The host's record of one rejoin it speaks for: the rejoin tick R and, once cut, the
+/// encoded catch-up bundle.
+struct Speaking {
+    seat: PlayerId,
+    at: Tick,
+    bundle: Option<Vec<u8>>,
 }
 
 /// One machine in one game. See the module documentation.
@@ -523,6 +559,13 @@ pub struct Node<T: Transport = UdpTransport> {
     paths_sent: Option<(Option<u8>, u16)>,
     /// A guest joined the room's relay room (or tried to).
     joined_room_relay: bool,
+    engine_load: EngineLoad,
+    /// Host, in the game: answers lobby traffic and serves rejoins.
+    rejoin_server: Option<RejoinServer>,
+    speaking: Vec<Speaking>,
+    /// A returning player: the catch-up to fast-forward through once loaded.
+    pending_rejoin: Option<(lockstep::Bundle, Tick)>,
+    rejoin_status: Option<String>,
 }
 
 impl Node<UdpTransport> {
@@ -580,6 +623,11 @@ impl<T: Transport> Node<T> {
             recv_errors: 0,
             paths_sent: None,
             joined_room_relay: false,
+            engine_load: EngineLoad::Idle,
+            rejoin_server: None,
+            speaking: Vec::new(),
+            pending_rejoin: None,
+            rejoin_status: None,
         };
         match role {
             Role::Browse(target) => node.open_browser(now, target.as_deref())?,
@@ -840,7 +888,7 @@ impl<T: Transport> Node<T> {
                     };
                     self.absorb_guest(now, step);
                 }
-                Lobby::Browse(_) | Lobby::None => {}
+                Lobby::Browse(_) | Lobby::Rejoin(_) | Lobby::None => {}
             },
             Phase::Game => {
                 if t.starts_with('/') {
@@ -882,6 +930,11 @@ impl<T: Transport> Node<T> {
             self.read_all(now);
             self.poll_all(now, engine);
             self.flush_sends();
+        }
+        // The caller now has the setup (Event::Loading): the engine loads from the next
+        // pump on.
+        if let EngineLoad::Announced(seed) = self.engine_load {
+            self.engine_load = EngineLoad::Loading(seed);
         }
         std::mem::take(&mut self.events)
     }
@@ -981,11 +1034,9 @@ impl<T: Transport> Node<T> {
         Ok(())
     }
 
-    fn open_guest(&mut self, now: Instant) -> Result<(), NodeError> {
-        let Some(via) = self.join else {
-            return Ok(());
-        };
-        let (host, via_code, relayed) = match via {
+    /// The lobby configuration of a guest joining through `self.join`.
+    fn guest_config(&mut self) -> Option<GuestConfig> {
+        let (host, via_code, relayed) = match self.join? {
             JoinVia::Direct { host, via_code } => (host, via_code, false),
             JoinVia::Relay { .. } => (peer_endpoint(0, session::DISCOVERY_PORT), false, true),
         };
@@ -1004,6 +1055,14 @@ impl<T: Transport> Node<T> {
             gc.game_addr = self.outside.map(|(_, g)| g);
             gc.stun_addr = self.outside.map(|(d, _)| d);
         }
+        Some(gc)
+    }
+
+    fn open_guest(&mut self, now: Instant) -> Result<(), NodeError> {
+        let Some(gc) = self.guest_config() else {
+            return Ok(());
+        };
+        let via_code = gc.via_code;
         let g = GuestLobby::new(gc, now).map_err(NodeError::Join)?;
         self.lobby = Lobby::Guest(Box::new(g));
         self.phase = Phase::Lobby;
@@ -1090,19 +1149,30 @@ impl<T: Transport> Node<T> {
     }
 
     /// SPEC 3.7 step 3: tear down the lobby, rebind the game port, start loading.
+    ///
+    /// The host keeps its discovery socket (and its STUN keepalive, 2.4, so the invite code
+    /// stays valid) for rejoins (session::rejoin); a guest closes it.
     fn begin_game(&mut self, now: Instant, gs: GameStart) {
         self.flush_sends();
-        self.traversal = None;
         self.puncher = Puncher::new();
         self.lobby = Lobby::None;
-        self.transport.close_discovery();
+        if self.role == Role::Host {
+            self.rejoin_server = Some(RejoinServer::new(
+                &self.cfg.build_id,
+                gs.session,
+                self.rng.bytes::<32>(),
+                self.cfg.password.clone(),
+            ));
+        } else {
+            self.traversal = None;
+            self.transport.close_discovery();
+        }
         if let Err(e) = self.transport.rebind_game() {
             self.end(Ended::Failed(e.to_string()));
             return;
         }
-        let mut load = LoadHandshake::new(gs.my_seat, &gs.peers, now);
-        // The toy engines load instantly; a real game would call this when it has.
-        load.set_loaded();
+        let load = LoadHandshake::new(gs.my_seat, &gs.peers, now);
+        self.engine_load = EngineLoad::Announced(gs.simulation_seed());
         let players: Vec<(PlayerId, String)> = gs
             .human_players()
             .into_iter()
@@ -1118,28 +1188,44 @@ impl<T: Transport> Node<T> {
         self.phase = Phase::Loading;
     }
 
-    fn begin_lockstep(&mut self) {
-        let (Some(gs), Some(load)) = (&self.start, self.load.take()) else {
-            return;
-        };
-        let book = load.addresses();
+    /// The lockstep configuration for the agreed game, with each remote at `endpoint_of`.
+    fn lockstep_config(
+        &self,
+        gs: &GameStart,
+        endpoint_of: impl Fn(PlayerId) -> Option<Endpoint>,
+    ) -> lockstep::Config {
         let players: Vec<PlayerConfig> = gs
             .human_players()
             .into_iter()
             .map(|(id, name)| PlayerConfig {
                 id,
                 name: name.to_owned(),
-                endpoint: if id == gs.my_seat { None } else { book.get(id) },
+                endpoint: if id == gs.my_seat {
+                    None
+                } else {
+                    endpoint_of(id)
+                },
             })
             .collect();
-        let mut cfg = lockstep::Config::new(gs.my_seat, players);
+        let mut cfg = lockstep::Config::new(gs.my_seat, players.clone());
         cfg.drop_timeout = self.cfg.drop_timeout;
-        for (p, ep) in book.iter() {
-            let cap = self.transport.max_datagram_to(ep);
-            if cap < MAX_DATAGRAM {
-                cfg.max_datagram.push((p, cap));
+        for p in &players {
+            if let Some(ep) = p.endpoint {
+                let cap = self.transport.max_datagram_to(ep);
+                if cap < MAX_DATAGRAM {
+                    cfg.max_datagram.push((p.id, cap));
+                }
             }
         }
+        cfg
+    }
+
+    fn begin_lockstep(&mut self) {
+        let (Some(gs), Some(load)) = (&self.start, self.load.take()) else {
+            return;
+        };
+        let book = load.addresses();
+        let cfg = self.lockstep_config(gs, |p| book.get(p));
         match Lockstep::new(cfg) {
             Ok(l) => {
                 self.lockstep = Some(l);
@@ -1147,6 +1233,75 @@ impl<T: Transport> Node<T> {
                 self.events.push(Event::GameRunning);
             }
             Err(e) => self.end(Ended::Failed(format!("Cannot start the game: {e}"))),
+        }
+    }
+
+    /// A returning player's catch-up arrived (session::rejoin): set up the game as if it had
+    /// just started, but skip the load handshake; once the engine has loaded,
+    /// fast-forward with `Lockstep::rejoin` (SPEC 5.6 steps 9-12).
+    fn begin_rejoin(&mut self, now: Instant, r: Rejoin) {
+        let bundle = match lockstep::Bundle::decode(&r.bundle) {
+            Ok(b) => b,
+            Err(e) => {
+                self.end(Ended::Failed(format!(
+                    "The catch-up from the host could not be read: {e}"
+                )));
+                return;
+            }
+        };
+        let gs = r.start;
+        self.flush_sends();
+        self.traversal = None;
+        self.puncher = Puncher::new();
+        self.lobby = Lobby::None;
+        self.transport.close_discovery();
+        let me = gs.my_seat.0;
+        let needs_relay = gs
+            .human_players()
+            .iter()
+            .any(|(p, _)| gs.paths.relayed(me, p.0));
+        if let (Some((relay, room)), true, None) =
+            (gs.paths.relay, needs_relay, self.transport.relay_link())
+        {
+            let nonce = self.rng.bytes::<8>();
+            if let Err(e) = self
+                .transport
+                .open_relay(RelayLink::guest(relay, room, nonce, now))
+            {
+                self.events.push(Event::RelayFailed(e.to_string()));
+            }
+        }
+        let players: Vec<(PlayerId, String)> = gs
+            .human_players()
+            .into_iter()
+            .map(|(p, n)| (p, n.to_owned()))
+            .collect();
+        self.events.push(Event::Loading {
+            seed: gs.simulation_seed(),
+            me: gs.my_seat,
+            players,
+        });
+        self.events.push(Event::Status(format!(
+            "Catching up to tick {} before rejoining...",
+            r.at.0.saturating_sub(1)
+        )));
+        self.engine_load = EngineLoad::Announced(gs.simulation_seed());
+        self.pending_rejoin = Some((bundle, r.at));
+        self.start = Some(gs);
+        self.phase = Phase::Loading;
+    }
+
+    fn begin_rejoin_lockstep(&mut self) {
+        let (Some(gs), Some((bundle, at))) = (&self.start, self.pending_rejoin.take()) else {
+            return;
+        };
+        let cfg = self.lockstep_config(gs, |p| gs.endpoint_of(p));
+        match Lockstep::rejoin(cfg, bundle, at) {
+            Ok(l) => {
+                self.lockstep = Some(l);
+                self.phase = Phase::Game;
+            }
+            Err(e) => self.end(Ended::Failed(format!("Cannot rejoin the game: {e}"))),
         }
     }
 
@@ -1223,8 +1378,25 @@ impl<T: Transport> Node<T> {
                 self.absorb_host(now, step);
             }
             Lobby::Guest(g) => {
+                // The host is in the game already: ask for a dropped seat back.
+                if let Some((session, challenge)) = rejoin::read_in_game(bytes) {
+                    if let Some(gc) = self.guest_config().filter(|c| c.host.ip() == from.ip()) {
+                        self.events.push(Event::Status(
+                            "The game is under way. Asking the host to rejoin it...".to_owned(),
+                        ));
+                        let nonce = u32::from_le_bytes(self.rng.bytes::<4>());
+                        let c = RejoinClient::new(gc, session, challenge, nonce, now);
+                        self.lobby = Lobby::Rejoin(Box::new(c));
+                        self.poll_rejoin_client(now);
+                    }
+                    return;
+                }
                 let step = g.on_datagram(now, from, bytes);
                 self.absorb_guest(now, step);
+            }
+            Lobby::Rejoin(c) => {
+                let step = c.on_datagram(now, from, bytes);
+                self.absorb_rejoin_client(now, step);
             }
             Lobby::Browse(b) => {
                 if let Some(heard) = session::read_announcement(from, bytes) {
@@ -1232,7 +1404,177 @@ impl<T: Transport> Node<T> {
                     self.events.extend(ev);
                 }
             }
-            Lobby::None => {}
+            Lobby::None => {
+                if let Some(srv) = self.rejoin_server.as_mut() {
+                    let step = srv.on_datagram(now, from, bytes);
+                    self.absorb_rejoin_server(now, step);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ rejoin
+
+    fn poll_rejoin_client(&mut self, now: Instant) {
+        if let Lobby::Rejoin(c) = &mut self.lobby {
+            let step = c.poll(now);
+            self.absorb_rejoin_client(now, step);
+        }
+    }
+
+    fn rejoin_status(&mut self, s: String) {
+        if self.rejoin_status.as_ref() != Some(&s) {
+            self.rejoin_status = Some(s.clone());
+            self.events.push(Event::Status(s));
+        }
+    }
+
+    fn absorb_rejoin_client(&mut self, now: Instant, step: Step<ClientEvent>) {
+        for o in step.send {
+            self.sends.push((Socket::Discovery, o));
+        }
+        for e in step.events {
+            match e {
+                ClientEvent::Waiting => self.rejoin_status(
+                    "Waiting for the game to let your old connection go...".to_owned(),
+                ),
+                ClientEvent::Offered { seat, at } => self.rejoin_status(format!(
+                    "The host offers seat {} back, from tick {}. Receiving the game so far...",
+                    seat.0, at.0
+                )),
+                ClientEvent::Progress { have, total } => self
+                    .events
+                    .push(Event::Log(format!("Catch-up: {have} of {total} bytes"))),
+                ClientEvent::Refused(r) => self.end(Ended::Failed(r.to_string())),
+                ClientEvent::HostSilent => self.end(Ended::Join(JoinError::HostLeft)),
+                ClientEvent::Corrupt => self.end(Ended::Failed(
+                    "The catch-up from the host could not be read".to_owned(),
+                )),
+                ClientEvent::Ready(r) => {
+                    self.begin_rejoin(now, *r);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn absorb_rejoin_server(&mut self, now: Instant, step: Step<ServerEvent>) {
+        for o in step.send {
+            self.sends.push((Socket::Discovery, o));
+        }
+        for e in step.events {
+            match e {
+                ServerEvent::Asked { nonce, name, from } => {
+                    self.events.push(Event::Log(format!(
+                        "{name} at {from} asks to rejoin the game"
+                    )));
+                    let step = self.answer_rejoin(now, nonce, &name);
+                    // Answers produce sends only, never further events.
+                    for o in step.send {
+                        self.sends.push((Socket::Discovery, o));
+                    }
+                }
+                ServerEvent::Delivered { seat } => self.events.push(Event::Log(format!(
+                    "{} has the game so far and is catching up",
+                    self.player_name(seat)
+                ))),
+                ServerEvent::GaveUp { seat } => {
+                    let who = seat.map_or_else(|| "a player".to_owned(), |p| self.player_name(p));
+                    self.events.push(Event::Log(format!(
+                        "Stopped waiting for {who} to rejoin: nothing heard"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Host: answer a request for the seat of the player called `name`.
+    fn answer_rejoin(&mut self, now: Instant, nonce: u32, name: &str) -> Step<ServerEvent> {
+        let seat = self.start.as_ref().and_then(|g| {
+            g.seats
+                .iter()
+                .find(|s| s.kind == SeatKind::Network && s.name.eq_ignore_ascii_case(name))
+                .map(|s| PlayerId(s.index))
+        });
+        let Some(seat) = seat else {
+            return match self.rejoin_server.as_mut() {
+                Some(srv) => srv.refuse(nonce, RejoinRefused::NoSuchPlayer),
+                None => Step::default(),
+            };
+        };
+        let Some(srv) = self.rejoin_server.as_mut() else {
+            return Step::default();
+        };
+        // Already speaking for this seat (an earlier attempt): offer the same tick.
+        if let Some(sp) = self.speaking.iter().find(|s| s.seat == seat) {
+            let mut step = srv.offer(nonce, seat, sp.at);
+            if let (Some(b), Some(gs)) = (&sp.bundle, &self.start) {
+                let more = srv.provide(now, seat, gs, &self.cfg.name, &self.cfg.game_label, b);
+                step.send.extend(more.send);
+            }
+            return step;
+        }
+        let Some(l) = self.lockstep.as_mut() else {
+            return srv.wait(nonce);
+        };
+        if !l.is_dropped(seat) {
+            return srv.wait(nonce);
+        }
+        match l.request_rejoin(seat) {
+            Ok(at) => {
+                let step = srv.offer(nonce, seat, at);
+                self.speaking.push(Speaking {
+                    seat,
+                    at,
+                    bundle: None,
+                });
+                let name = self.player_name(seat);
+                self.events.push(Event::Log(format!(
+                    "Letting {name} back in at tick {}",
+                    at.0
+                )));
+                step
+            }
+            Err(lockstep::RejoinRefusal::NotSpeaker) => {
+                srv.refuse(nonce, RejoinRefused::NotSpeaker)
+            }
+            Err(lockstep::RejoinRefusal::NotRecording) => {
+                srv.refuse(nonce, RejoinRefused::NotRecording)
+            }
+            Err(_) => srv.wait(nonce),
+        }
+    }
+
+    /// Host: the lockstep reached R-1 for a rejoin it speaks for; send the catch-up.
+    fn on_bundle_ready(&mut self, now: Instant, player: PlayerId) {
+        let Some(l) = self.lockstep.as_ref() else {
+            return;
+        };
+        let bytes = match l.cut_bundle(player) {
+            Ok(b) => b.encode(),
+            Err(e) => {
+                self.events.push(Event::Log(format!(
+                    "Cannot let {} back in: {e}",
+                    self.player_name(player)
+                )));
+                return;
+            }
+        };
+        if let (Some(srv), Some(gs)) = (self.rejoin_server.as_mut(), &self.start) {
+            let step = srv.provide(
+                now,
+                player,
+                gs,
+                &self.cfg.name,
+                &self.cfg.game_label,
+                &bytes,
+            );
+            for o in step.send {
+                self.sends.push((Socket::Discovery, o));
+            }
+        }
+        if let Some(sp) = self.speaking.iter_mut().find(|s| s.seat == player) {
+            sp.bundle = Some(bytes);
         }
     }
 
@@ -1310,6 +1652,7 @@ impl<T: Transport> Node<T> {
                 self.absorb_guest(now, step);
                 self.maybe_show_reply_code(now);
             }
+            Lobby::Rejoin(_) => self.poll_rejoin_client(now),
             Lobby::Browse(b) => {
                 let mut out = Vec::new();
                 b.prober.poll(now, &mut out);
@@ -1332,7 +1675,18 @@ impl<T: Transport> Node<T> {
             self.update_paths(now);
             self.update_roster();
         }
+        if let Some(srv) = self.rejoin_server.as_mut() {
+            let step = srv.poll(now);
+            self.absorb_rejoin_server(now, step);
+        }
         if self.phase == Phase::Loading {
+            self.poll_engine_load(engine);
+        }
+        if self.phase == Phase::Loading && self.pending_rejoin.is_some() {
+            if self.engine_load == EngineLoad::Loaded {
+                self.begin_rejoin_lockstep();
+            }
+        } else if self.phase == Phase::Loading {
             let mut out = Vec::new();
             let result = match self.load.as_mut() {
                 Some(l) => l.poll(now, &mut out),
@@ -1354,6 +1708,18 @@ impl<T: Transport> Node<T> {
         }
     }
 
+    /// Call [`Engine::load`] until it reports the engine loaded.
+    fn poll_engine_load(&mut self, engine: &mut impl Engine) {
+        if let EngineLoad::Loading(seed) = self.engine_load {
+            if engine.load(seed) {
+                self.engine_load = EngineLoad::Loaded;
+                if let Some(l) = self.load.as_mut() {
+                    l.set_loaded();
+                }
+            }
+        }
+    }
+
     fn poll_lockstep(&mut self, now: Instant, engine: &mut impl Engine) {
         let Some(l) = self.lockstep.as_mut() else {
             return;
@@ -1363,6 +1729,12 @@ impl<T: Transport> Node<T> {
         self.sends
             .extend(out.outgoing.into_iter().map(|o| (Socket::Game, o)));
         for e in out.events {
+            if let lockstep::Event::RejoinBundleReady { player, .. } = &e {
+                self.on_bundle_ready(now, *player);
+            }
+            if let lockstep::Event::PlayerRejoined { player, .. } = &e {
+                self.speaking.retain(|s| s.seat != *player);
+            }
             self.on_lockstep(e);
         }
         let caption = caption.map(|c| self.caption_text(&c));
@@ -1521,7 +1893,7 @@ impl<T: Transport> Node<T> {
                 self.after_traversal(now);
             }
             TraversalEvent::DiscoveryChanged(ep) => match &self.lobby {
-                Lobby::Host(_) => {
+                Lobby::Host(_) | Lobby::None if self.role == Role::Host => {
                     if let Ok(code) = invite::encode(ep) {
                         self.invite_code = Some(code.clone());
                         self.events.push(Event::InviteCodeChanged(code));

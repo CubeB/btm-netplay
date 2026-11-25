@@ -135,6 +135,60 @@ pub(super) struct Leave {
     pub token: u32,
 }
 
+/// Host to a lobby prober or claimer while the game runs: "this game is under way; ask to
+/// rejoin" (see `rejoin`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct InGame {
+    pub session: u64,
+    pub challenge: [u8; 16],
+}
+
+/// A dropped player asks for its seat back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Ask {
+    pub build: Vec<u8>,
+    pub session: u64,
+    pub nonce: u32,
+    pub name: String,
+    pub proof: Option<[u8; 32]>,
+}
+
+/// The host's answer to an [`Ask`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AnswerKind {
+    /// The seat is not free yet (the old connection is still being dropped).
+    Wait,
+    /// The seat is offered: rejoin at tick `at`; the game so far follows in chunks.
+    Offer { seat: u8, at: u32 },
+    /// Refused, with a reason code (see `rejoin::RejoinRefused`).
+    Refuse(u8),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Answer {
+    pub session: u64,
+    pub nonce: u32,
+    pub kind: AnswerKind,
+}
+
+/// One piece of the catch-up payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Chunk {
+    pub session: u64,
+    pub nonce: u32,
+    pub offset: u32,
+    pub total: u32,
+    pub data: Vec<u8>,
+}
+
+/// The returning player holds the first `have` bytes of the payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Ack {
+    pub session: u64,
+    pub nonce: u32,
+    pub have: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Msg {
     Announce(Announce),
@@ -142,6 +196,11 @@ pub(super) enum Msg {
     Probe,
     Refuse(Refuse),
     Leave(Leave),
+    InGame(InGame),
+    Ask(Ask),
+    Answer(Answer),
+    Chunk(Chunk),
+    Ack(Ack),
 }
 
 const KIND_ANNOUNCE: u8 = 1;
@@ -149,6 +208,11 @@ const KIND_CLAIM: u8 = 2;
 const KIND_PROBE: u8 = 3;
 const KIND_REFUSE: u8 = 4;
 const KIND_LEAVE: u8 = 5;
+const KIND_IN_GAME: u8 = 6;
+const KIND_ASK: u8 = 7;
+const KIND_ANSWER: u8 = 8;
+const KIND_CHUNK: u8 = 9;
+const KIND_ACK: u8 = 10;
 
 // ---------------------------------------------------------------------------------------
 // Writing.
@@ -422,6 +486,62 @@ pub(super) fn encode_refuse(r: &Refuse) -> Vec<u8> {
         put_str(&mut b, &e.id, MAX_MOD_ID);
     }
     put_field(&mut out, 4, &b);
+    out
+}
+
+pub(super) fn encode_in_game(build: &[u8], m: &InGame) -> Vec<u8> {
+    let mut out = header(KIND_IN_GAME, build);
+    put_field(&mut out, 1, &m.session.to_le_bytes());
+    put_field(&mut out, 2, &m.challenge);
+    out
+}
+
+pub(super) fn encode_ask(m: &Ask) -> Vec<u8> {
+    let mut out = header(KIND_ASK, &m.build);
+    put_field(&mut out, 1, &m.session.to_le_bytes());
+    put_field(&mut out, 2, &m.nonce.to_le_bytes());
+    let mut b = Vec::new();
+    put_str(&mut b, &m.name, MAX_NAME);
+    put_field(&mut out, 3, &b);
+    if let Some(p) = &m.proof {
+        put_field(&mut out, 4, p);
+    }
+    out
+}
+
+pub(super) fn encode_answer(build: &[u8], m: &Answer) -> Vec<u8> {
+    let mut out = header(KIND_ANSWER, build);
+    put_field(&mut out, 1, &m.session.to_le_bytes());
+    put_field(&mut out, 2, &m.nonce.to_le_bytes());
+    let b = match m.kind {
+        AnswerKind::Wait => vec![0],
+        AnswerKind::Offer { seat, at } => {
+            let mut b = vec![1, seat];
+            b.extend_from_slice(&at.to_le_bytes());
+            b
+        }
+        AnswerKind::Refuse(code) => vec![2, code],
+    };
+    put_field(&mut out, 3, &b);
+    out
+}
+
+pub(super) fn encode_chunk(build: &[u8], m: &Chunk) -> Vec<u8> {
+    let mut out = header(KIND_CHUNK, build);
+    put_field(&mut out, 1, &m.session.to_le_bytes());
+    put_field(&mut out, 2, &m.nonce.to_le_bytes());
+    let mut b = m.offset.to_le_bytes().to_vec();
+    b.extend_from_slice(&m.total.to_le_bytes());
+    put_field(&mut out, 3, &b);
+    put_field(&mut out, 4, &m.data);
+    out
+}
+
+pub(super) fn encode_ack(build: &[u8], m: &Ack) -> Vec<u8> {
+    let mut out = header(KIND_ACK, build);
+    put_field(&mut out, 1, &m.session.to_le_bytes());
+    put_field(&mut out, 2, &m.nonce.to_le_bytes());
+    put_field(&mut out, 3, &m.have.to_le_bytes());
     out
 }
 
@@ -836,6 +956,55 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Msg, DecodeError> {
         KIND_LEAVE => Ok(Msg::Leave(Leave {
             session: fields.need(1)?.u64()?,
             token: fields.need(2)?.u32()?,
+        })),
+        KIND_IN_GAME => Ok(Msg::InGame(InGame {
+            session: fields.need(1)?.u64()?,
+            challenge: fields.need(2)?.array::<16>()?,
+        })),
+        KIND_ASK => Ok(Msg::Ask(Ask {
+            build,
+            session: fields.need(1)?.u64()?,
+            nonce: fields.need(2)?.u32()?,
+            name: fields.need(3)?.string(MAX_NAME)?,
+            proof: match fields.find(4) {
+                Some(b) => Some(Reader::new(b).array::<32>()?),
+                None => None,
+            },
+        })),
+        KIND_ANSWER => {
+            let mut r = fields.need(3)?;
+            let kind = match r.u8()? {
+                0 => AnswerKind::Wait,
+                1 => {
+                    let seat = r.u8()?;
+                    if usize::from(seat) >= SEATS {
+                        return Err(DecodeError::Invalid);
+                    }
+                    AnswerKind::Offer { seat, at: r.u32()? }
+                }
+                2 => AnswerKind::Refuse(r.u8()?),
+                _ => return Err(DecodeError::Invalid),
+            };
+            Ok(Msg::Answer(Answer {
+                session: fields.need(1)?.u64()?,
+                nonce: fields.need(2)?.u32()?,
+                kind,
+            }))
+        }
+        KIND_CHUNK => {
+            let mut r = fields.need(3)?;
+            Ok(Msg::Chunk(Chunk {
+                session: fields.need(1)?.u64()?,
+                nonce: fields.need(2)?.u32()?,
+                offset: r.u32()?,
+                total: r.u32()?,
+                data: fields.find(4).ok_or(DecodeError::Missing(4))?.to_vec(),
+            }))
+        }
+        KIND_ACK => Ok(Msg::Ack(Ack {
+            session: fields.need(1)?.u64()?,
+            nonce: fields.need(2)?.u32()?,
+            have: fields.need(3)?.u32()?,
         })),
         k => Err(DecodeError::BadKind(k)),
     }

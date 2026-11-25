@@ -462,35 +462,7 @@ impl GuestLobby {
     }
 
     fn build_view(&self, from: Endpoint, a: &Announce) -> LobbyView {
-        let mut seats: Vec<SeatInfo> = (0..SEATS as u8).map(SeatInfo::open).collect();
-        for s in &a.seats {
-            if let Some(slot) = seats.get_mut(usize::from(s.index)) {
-                *slot = s.clone();
-            }
-        }
-        // The host's own game address (2.8, 22): believed only when joined by a code.
-        if let Some(s) = seats.first_mut() {
-            if s.kind == SeatKind::Host {
-                s.addr = Some(if self.cfg.via_code {
-                    resolve_addr(from, s.addr, a.game_port)
-                } else {
-                    SocketAddrV4::new(*from.ip(), a.game_port)
-                });
-            }
-        }
-        LobbyView {
-            session: a.session,
-            label: a.label.clone(),
-            host_name: a.host_name.clone(),
-            map: a.map.clone(),
-            options: a.options.clone(),
-            seats,
-            epoch: a.epoch,
-            launching: a.launching,
-            approval_required: a.approval,
-            chat: a.chat.clone(),
-            paths: a.paths.clone(),
-        }
+        view_from_announce(from, a, self.cfg.via_code)
     }
 
     fn on_announce(
@@ -700,5 +672,38 @@ impl GuestLobby {
             to: self.cfg.host,
             bytes,
         });
+    }
+}
+
+/// The room as a guest mirrors it from an announcement heard from `from`. The host's own
+/// game address (2.8) is believed only when the guest joined by a code.
+pub(super) fn view_from_announce(from: Endpoint, a: &Announce, via_code: bool) -> LobbyView {
+    let mut seats: Vec<SeatInfo> = (0..SEATS as u8).map(SeatInfo::open).collect();
+    for s in &a.seats {
+        if let Some(slot) = seats.get_mut(usize::from(s.index)) {
+            *slot = s.clone();
+        }
+    }
+    if let Some(s) = seats.first_mut() {
+        if s.kind == SeatKind::Host {
+            s.addr = Some(if via_code {
+                resolve_addr(from, s.addr, a.game_port)
+            } else {
+                SocketAddrV4::new(*from.ip(), a.game_port)
+            });
+        }
+    }
+    LobbyView {
+        session: a.session,
+        label: a.label.clone(),
+        host_name: a.host_name.clone(),
+        map: a.map.clone(),
+        options: a.options.clone(),
+        seats,
+        epoch: a.epoch,
+        launching: a.launching,
+        approval_required: a.approval,
+        chat: a.chat.clone(),
+        paths: a.paths.clone(),
     }
 }
