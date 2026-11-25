@@ -48,6 +48,13 @@
 //!   with a version-2 code it joins the room and finds the host at the synthetic endpoint
 //!   of member 0.
 //!
+//! Mixed rooms: once the host has a relay room, it announces it, and every guest joins it
+//! too, even one that reached the host directly. Each peer reports its member index and
+//! the seats it has heard punch it ([`crate::session::PathTable`]). The host freezes that
+//! table when the launch starts, so every peer addresses every pair the same way: directly
+//! if the two heard each other's punches, otherwise through the relay. The host cannot
+//! start while some pair has neither path.
+//!
 //! Another transport (an in-memory network for tests, a different relay) implements the
 //! same trait and is passed to [`Node::with_transport`].
 
@@ -512,6 +519,10 @@ pub struct Node<T: Transport = UdpTransport> {
     sends: Vec<(Socket, Outgoing)>,
     send_errors: HashSet<Endpoint>,
     recv_errors: u64,
+    /// The path-table part last given to the lobby: (relay member, heard mask).
+    paths_sent: Option<(Option<u8>, u16)>,
+    /// A guest joined the room's relay room (or tried to).
+    joined_room_relay: bool,
 }
 
 impl Node<UdpTransport> {
@@ -567,6 +578,8 @@ impl<T: Transport> Node<T> {
             sends: Vec::new(),
             send_errors: HashSet::new(),
             recv_errors: 0,
+            paths_sent: None,
+            joined_room_relay: false,
         };
         match role {
             Role::Browse(target) => node.open_browser(now, target.as_deref())?,
@@ -1316,6 +1329,7 @@ impl<T: Transport> Node<T> {
             self.puncher.poll(now, &mut out);
             self.sends
                 .extend(out.into_iter().map(|o| (Socket::Game, o)));
+            self.update_paths(now);
             self.update_roster();
         }
         if self.phase == Phase::Loading {
@@ -1421,7 +1435,10 @@ impl<T: Transport> Node<T> {
         match e {
             TransportEvent::Log(s) => self.events.push(Event::Log(s)),
             TransportEvent::Relay(RelayEvent::Joined { room, me }) => {
-                if let (Lobby::Host(_), Some(relay)) = (&self.lobby, self.cfg.relay) {
+                if let (Lobby::Host(h), Some(relay)) = (&mut self.lobby, self.cfg.relay) {
+                    // Every human peer joins this room too (session::PathTable).
+                    let step = h.set_relay(now, Some((relay, room)), Some(me));
+                    self.absorb_host(now, step);
                     let inv = RelayInvite {
                         relay: RelayRef::Endpoint(relay),
                         room,
@@ -1442,6 +1459,10 @@ impl<T: Transport> Node<T> {
                             self.end(Ended::Failed(e.to_string()));
                         }
                     }
+                } else {
+                    self.events.push(Event::Log(format!(
+                        "Joined the room's relay as member {me}, for the players who cannot                          be reached directly"
+                    )));
                 }
             }
             TransportEvent::Relay(RelayEvent::Members(m)) => self.events.push(Event::Log(format!(
@@ -1453,6 +1474,11 @@ impl<T: Transport> Node<T> {
             }
             TransportEvent::Relay(RelayEvent::Failed(e)) => {
                 self.events.push(Event::RelayFailed(e.to_string()));
+                if let Lobby::Host(h) = &mut self.lobby {
+                    // No relay room any more: every pair is direct again.
+                    let step = h.set_relay(now, None, None);
+                    self.absorb_host(now, step);
+                }
                 if matches!(self.join, Some(JoinVia::Relay { .. })) {
                     self.end(Ended::Failed(e.to_string()));
                 }
@@ -1680,6 +1706,66 @@ impl<T: Transport> Node<T> {
         if !host_side {
             self.on_punch_events(evs);
         }
+    }
+
+    /// Keep this peer's part of the path table current (session::PathTable): join the
+    /// room's relay room when the host has one, and report the relay member index and the
+    /// seats heard punching.
+    fn update_paths(&mut self, now: Instant) {
+        let room = match &self.lobby {
+            Lobby::Guest(g) => g.view().and_then(|v| v.paths.relay),
+            _ => None,
+        };
+        if let (Some((relay, room)), false) = (room, self.joined_room_relay) {
+            self.joined_room_relay = true;
+            if self.transport.relay_link().is_none() {
+                let nonce = self.rng.bytes::<8>();
+                match self
+                    .transport
+                    .open_relay(RelayLink::guest(relay, room, nonce, now))
+                {
+                    Ok(()) => self.events.push(Event::Log(format!(
+                        "The host has a relay room; joining it at {relay}"
+                    ))),
+                    Err(e) => self.events.push(Event::RelayFailed(e.to_string())),
+                }
+            }
+        }
+        let member = self.transport.relay_link().and_then(RelayLink::me);
+        let heard = self.heard_mask();
+        if self.paths_sent == Some((member, heard)) {
+            return;
+        }
+        self.paths_sent = Some((member, heard));
+        match &mut self.lobby {
+            Lobby::Host(h) => {
+                let step = h.set_heard(now, heard);
+                self.absorb_host(now, step);
+            }
+            Lobby::Guest(g) => {
+                let step = g.set_paths(now, member, heard);
+                self.absorb_guest(now, step);
+            }
+            _ => {}
+        }
+    }
+
+    /// A bit per remote human seat whose game address a punch arrived from.
+    fn heard_mask(&self) -> u16 {
+        let mine = match &self.lobby {
+            Lobby::Host(_) => Some(0),
+            Lobby::Guest(g) => g.my_seat().map(|p| p.0),
+            _ => None,
+        };
+        let Some(view) = self.lobby_view() else {
+            return 0;
+        };
+        let sources = self.puncher.sources();
+        view.seats
+            .iter()
+            .filter(|s| s.kind.is_human() && Some(s.index) != mine && s.index < 16)
+            .filter(|s| s.addr.is_some_and(|a| sources.contains(&a)))
+            .fold(0u16, |m, s| m | (1 << s.index))
     }
 
     fn on_punch_events(&mut self, evs: Vec<PunchEvent>) {

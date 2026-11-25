@@ -147,15 +147,22 @@ The caller runs one extra UDP socket for the relay, on any local port.
 
 What it means for the rest of the crate:
 
-- The host records each guest's game address as `0.0.0.(k+1):<game port>`. Every
-  `GameStart::peers` entry is therefore a synthetic endpoint, and it means the same
-  member on every machine. Guest-to-guest traffic goes through the relay too, which
-  also covers SPEC 10 item 8 (three or more players across NATs).
+- The host records a relay-joined guest's game address as `0.0.0.(k+1):<game port>`.
+  A synthetic endpoint means the same member on every machine. Guest-to-guest traffic
+  goes through the relay too, which also covers SPEC 10 item 8 (three or more players
+  across NATs).
+- **Mixed rooms.** Once the host has a relay room, the announcement names it, and every
+  guest joins it, including one that reached the host directly. Each guest's claim
+  reports its member index and the seats it has heard punch it. The host announces the
+  resulting table (`session::PathTable`) and freezes it when the launch starts. Every peer
+  then derives `GameStart::peers` from the same table, pair by pair: **direct** (seat
+  addresses) if each of the two heard the other's punches, otherwise **relayed**
+  (synthetic endpoints) if both are members. Start is blocked while a pair has neither.
 - All synthetic endpoints share one /16, so the address following of SPEC 2.8 may move a
   seat between synthetic endpoints. This is no worse than the direct case, which has no
   authentication either.
-- Punching (2.5) is pointless in a relayed room. The puncher's datagrams to synthetic
-  endpoints are relayed harmlessly, or the caller can skip punching.
+- Punching (2.5) still runs between real addresses in a room with a relay: it is what
+  decides which pairs go direct. Synthetic endpoints are never punched.
 - The game-port handover (2.1) doesn't apply. The relay socket stays open from the lobby
   into the game.
 

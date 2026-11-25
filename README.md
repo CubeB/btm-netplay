@@ -42,5 +42,4 @@ target/release/btm-netplay-demo join BTM-XXXX-XXXX-XXXXX --name B
 Work in progress. Not yet wired into an engine. Known gaps:
 
 - rejoin isn't driven by the socket layer yet;
-- a game that mixes direct and relayed peers can't connect them;
 - IPv6 isn't supported.

@@ -302,6 +302,7 @@ impl HostLobby {
             launching: false,
             approval_required: cfg.require_approval,
             chat: Vec::new(),
+            paths: super::PathTable::default(),
         };
         let mut me = Self {
             challenge,
@@ -367,6 +368,16 @@ impl HostLobby {
         }
         if !self.view.seats.iter().any(|s| s.kind == SeatKind::Network) {
             return Some(StartBlocker::WaitingForPlayer);
+        }
+        if let Some((a, b)) = self.view.paths.unconnected(&self.view.seats) {
+            let name = |i: u8| {
+                self.view
+                    .seats
+                    .get(usize::from(i))
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default()
+            };
+            return Some(StartBlocker::Unconnected(name(a), name(b)));
         }
         None
     }
@@ -758,6 +769,37 @@ impl HostLobby {
         self.done(now)
     }
 
+    /// The relay room every human peer should join, and the host's member index in it
+    /// ([`super::PathTable`]). Ignored once the launch has started (the table is frozen).
+    pub fn set_relay(
+        &mut self,
+        now: Instant,
+        room: Option<(Endpoint, crate::relay::RoomId)>,
+        member: Option<u8>,
+    ) -> Step<HostEvent> {
+        if self.launch.is_none() && !self.finished {
+            self.view.paths.relay = room;
+            if let Some(m) = self.view.paths.members.first_mut() {
+                *m = member.map(|member| super::RelaySeat {
+                    member,
+                    game_port: self.cfg.game_port,
+                });
+            }
+        }
+        self.done(now)
+    }
+
+    /// The seats the host has heard a punch from, a bit per seat. Ignored once the launch
+    /// has started.
+    pub fn set_heard(&mut self, now: Instant, heard: u16) -> Step<HostEvent> {
+        if self.launch.is_none() && !self.finished {
+            if let Some(h) = self.view.paths.heard.first_mut() {
+                *h = heard;
+            }
+        }
+        self.done(now)
+    }
+
     /// Add an unicast announcement target.
     pub fn add_announce_target(&mut self, ep: Endpoint) {
         if !self.targets.contains(&ep) {
@@ -859,6 +901,7 @@ impl HostLobby {
         if let Some(s) = self.view.seats.get_mut(usize::from(seat)) {
             *s = SeatInfo::open(seat);
         }
+        self.view.paths.clear_seat(seat);
         for c in &mut self.claims {
             if c.seated == Some(seat) {
                 c.seated = None;
@@ -1020,6 +1063,7 @@ impl HostLobby {
             options: self.view.options.clone(),
             chat: self.view.chat.clone(),
             mods_hash: *self.cfg.mods.hash(),
+            paths: self.view.paths.clone(),
         }
     }
 
@@ -1226,10 +1270,25 @@ impl HostLobby {
             None => self.try_seat(now, token, step),
         }
         self.take_chat(idx, &c.chat, step);
+        let seated_now = self.claims.get(idx).and_then(|r| r.seated);
+        if let (Some(seat), None) = (seated_now, self.launch) {
+            // The guest's part of the path table; frozen once the launch starts.
+            let member = c.relay_member.or_else(|| crate::relay::member_of(from));
+            let paths = &mut self.view.paths;
+            if let Some(m) = paths.members.get_mut(usize::from(seat)) {
+                *m = member.map(|member| super::RelaySeat {
+                    member,
+                    game_port: c.game_port,
+                });
+            }
+            if let Some(h) = paths.heard.get_mut(usize::from(seat)) {
+                *h = c.heard;
+            }
+        }
         self.finish(now, step);
         self.reply_announce(now, from, step);
         // A claim that could not be seated because the room is full or launching.
-        let seated_now = self.claims.get(idx).is_some_and(|r| r.seated.is_some());
+        let seated_now = seated_now.is_some();
         if !seated_now {
             if self.launch.is_some() {
                 self.refuse(

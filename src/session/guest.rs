@@ -155,6 +155,8 @@ pub struct GuestLobby {
     closed: bool,
     started: bool,
     last_status: Option<GuestStatus>,
+    relay_member: Option<u8>,
+    heard: u16,
 }
 
 fn derive_token(seed: &[u8; 16], n: u32) -> u32 {
@@ -202,6 +204,8 @@ impl GuestLobby {
             closed: false,
             started: false,
             last_status: None,
+            relay_member: None,
+            heard: 0,
         })
     }
 
@@ -269,6 +273,17 @@ impl GuestLobby {
         self.cfg.game_addr = game;
         self.cfg.stun_addr = stun;
         self.dirty = true;
+        self.done(now)
+    }
+
+    /// This peer's part of the path table ([`super::PathTable`]): its member index in the
+    /// room's relay room, and a bit per seat it has heard a punch from.
+    pub fn set_paths(&mut self, now: Instant, member: Option<u8>, heard: u16) -> Step<GuestEvent> {
+        if (member, heard) != (self.relay_member, self.heard) {
+            self.relay_member = member;
+            self.heard = heard;
+            self.dirty = true;
+        }
         self.done(now)
     }
 
@@ -474,6 +489,7 @@ impl GuestLobby {
             launching: a.launching,
             approval_required: a.approval,
             chat: a.chat.clone(),
+            paths: a.paths.clone(),
         }
     }
 
@@ -650,6 +666,8 @@ impl GuestLobby {
             chat: self.outbox.iter().cloned().collect(),
             proof,
             mods: self.cfg.mods.clone(),
+            relay_member: self.relay_member,
+            heard: self.heard,
         })
     }
 

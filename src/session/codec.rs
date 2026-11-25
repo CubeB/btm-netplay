@@ -14,10 +14,10 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 
 use super::{
     clean, option_name_ok, ChatLine, Endpoint, MapInfo, ModDiff, ModDiffKind, ModDifference,
-    ModEntry, ModSet, SeatInfo, SeatKind, MAX_ANNOUNCED_CHAT, MAX_BUILD_ID, MAX_CHAT_LINE,
-    MAX_CLAIM_CHAT, MAX_LABEL, MAX_LOBBY_DATAGRAM, MAX_MAP_IDENTITY, MAX_MAP_NAME, MAX_MODS,
-    MAX_MOD_ID, MAX_MOD_VERSION, MAX_NAME, MAX_OPTIONS, MAX_OPTION_NAME, MAX_OPTION_VALUE,
-    MAX_PERSONALITY, MAX_RESOURCE, SEATS,
+    ModEntry, ModSet, PathTable, RelaySeat, SeatInfo, SeatKind, MAX_ANNOUNCED_CHAT, MAX_BUILD_ID,
+    MAX_CHAT_LINE, MAX_CLAIM_CHAT, MAX_LABEL, MAX_LOBBY_DATAGRAM, MAX_MAP_IDENTITY, MAX_MAP_NAME,
+    MAX_MODS, MAX_MOD_ID, MAX_MOD_VERSION, MAX_NAME, MAX_OPTIONS, MAX_OPTION_NAME,
+    MAX_OPTION_VALUE, MAX_PERSONALITY, MAX_RESOURCE, SEATS,
 };
 
 const MAGIC: [u8; 2] = *b"BL";
@@ -80,6 +80,7 @@ pub(super) struct Announce {
     pub options: Vec<(String, String)>,
     pub chat: Vec<ChatLine>,
     pub mods_hash: [u8; 32],
+    pub paths: PathTable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +102,10 @@ pub(super) struct Claim {
     pub chat: Vec<(u32, String)>,
     pub proof: Option<[u8; 32]>,
     pub mods: ModSet,
+    /// The sender's member index in the room's relay room, once joined.
+    pub relay_member: Option<u8>,
+    /// A bit per seat the sender has heard a punch from.
+    pub heard: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +233,32 @@ fn put_seat(out: &mut Vec<u8>, s: &SeatInfo) {
     out.extend_from_slice(&b);
 }
 
+const NO_MEMBER: u8 = 0xFF;
+
+fn put_paths(out: &mut Vec<u8>, p: &PathTable) {
+    match p.relay {
+        Some((relay, room)) => {
+            out.push(1);
+            put_addr(out, relay);
+            out.extend_from_slice(&room.to_le_bytes());
+        }
+        None => out.push(0),
+    }
+    for (m, h) in p.members.iter().zip(p.heard.iter()) {
+        match m {
+            Some(r) => {
+                out.push(r.member);
+                out.extend_from_slice(&r.game_port.to_le_bytes());
+            }
+            None => {
+                out.push(NO_MEMBER);
+                out.extend_from_slice(&0u16.to_le_bytes());
+            }
+        }
+        out.extend_from_slice(&h.to_le_bytes());
+    }
+}
+
 fn announce_bytes(a: &Announce, chat_n: usize, opt_n: usize) -> Vec<u8> {
     let mut out = header(KIND_ANNOUNCE, &a.build);
     put_field(&mut out, 1, &a.session.to_le_bytes());
@@ -273,6 +304,9 @@ fn announce_bytes(a: &Announce, chat_n: usize, opt_n: usize) -> Vec<u8> {
         }
         put_field(&mut out, 11, &b);
     }
+    let mut b = Vec::new();
+    put_paths(&mut b, &a.paths);
+    put_field(&mut out, 12, &b);
     out
 }
 
@@ -330,6 +364,9 @@ fn claim_bytes(c: &Claim, chat_n: usize) -> Vec<u8> {
         }
         put_field(&mut out, 9, &b);
     }
+    let mut b = vec![c.relay_member.unwrap_or(NO_MEMBER)];
+    b.extend_from_slice(&c.heard.to_le_bytes());
+    put_field(&mut out, 10, &b);
     out
 }
 
@@ -539,6 +576,38 @@ fn read_seat(r: &mut Reader<'_>) -> Result<SeatInfo, DecodeError> {
     })
 }
 
+fn read_member(member: u8) -> Result<Option<u8>, DecodeError> {
+    match member {
+        NO_MEMBER => Ok(None),
+        m if m < crate::relay::MAX_MEMBERS => Ok(Some(m)),
+        _ => Err(DecodeError::Invalid),
+    }
+}
+
+fn read_paths(r: &mut Reader<'_>) -> Result<PathTable, DecodeError> {
+    let relay = match r.u8()? {
+        0 => None,
+        1 => Some((r.addr()?, r.u64()?)),
+        _ => return Err(DecodeError::Invalid),
+    };
+    let mut p = PathTable {
+        relay,
+        ..PathTable::default()
+    };
+    for i in 0..SEATS {
+        let member = read_member(r.u8()?)?;
+        let game_port = r.u16()?;
+        let heard = r.u16()?;
+        if let Some(slot) = p.members.get_mut(i) {
+            *slot = member.map(|member| RelaySeat { member, game_port });
+        }
+        if let Some(slot) = p.heard.get_mut(i) {
+            *slot = heard & ((1 << SEATS) - 1);
+        }
+    }
+    Ok(p)
+}
+
 fn read_announce(build: Vec<u8>, f: &Fields<'_>) -> Result<Announce, DecodeError> {
     let session = f.need(1)?.u64()?;
     let mut r = f.need(2)?;
@@ -626,6 +695,10 @@ fn read_announce(build: Vec<u8>, f: &Fields<'_>) -> Result<Announce, DecodeError
         options,
         chat,
         mods_hash,
+        paths: match f.find(12) {
+            Some(b) => read_paths(&mut Reader::new(b))?,
+            None => PathTable::default(),
+        },
     })
 }
 
@@ -663,6 +736,13 @@ fn read_claim(build: Vec<u8>, f: &Fields<'_>) -> Result<Claim, DecodeError> {
             chat.push((seq, r.string(MAX_CHAT_LINE)?));
         }
     }
+    let (relay_member, heard) = match f.find(10) {
+        Some(b) => {
+            let mut r = Reader::new(b);
+            (read_member(r.u8()?)?, r.u16()?)
+        }
+        None => (None, 0),
+    };
     Ok(Claim {
         build,
         session,
@@ -681,6 +761,8 @@ fn read_claim(build: Vec<u8>, f: &Fields<'_>) -> Result<Claim, DecodeError> {
         chat,
         proof,
         mods,
+        relay_member,
+        heard: heard & ((1 << SEATS) - 1),
     })
 }
 

@@ -216,6 +216,8 @@ fn base_claim(session: u64, token: u32, name: &str, seat: u8) -> Claim {
         chat: Vec::new(),
         proof: None,
         mods: ModSet::default(),
+        relay_member: None,
+        heard: 0,
     }
 }
 
@@ -1399,7 +1401,26 @@ fn sample_announce() -> Announce {
             text: "hi".into(),
         }],
         mods_hash: [8; 32],
+        paths: sample_paths(),
     }
+}
+
+fn sample_paths() -> PathTable {
+    let mut p = PathTable {
+        relay: Some((ep(9, 8, 7, 6, 3479), 0xABCD)),
+        ..PathTable::default()
+    };
+    p.members[0] = Some(RelaySeat {
+        member: 0,
+        game_port: 1337,
+    });
+    p.members[1] = Some(RelaySeat {
+        member: 3,
+        game_port: 40000,
+    });
+    p.heard[0] = 0b10;
+    p.heard[1] = 0b01;
+    p
 }
 
 fn sample_claim() -> Claim {
@@ -1412,6 +1433,8 @@ fn sample_claim() -> Claim {
     c.chat = vec![(1, "a".into()), (2, "b".into())];
     c.proof = Some([6; 32]);
     c.mods = ModSet::new([3; 32], vec![mod_entry("m", "1", 1)]).unwrap();
+    c.relay_member = Some(4);
+    c.heard = 0b101;
     c
 }
 
@@ -1818,4 +1841,105 @@ fn game_start_helpers() {
     assert_eq!(gs.local_game_port, GAME_PORT);
     assert_eq!(gs.endpoint_of(PlayerId(5)), None);
     assert_eq!(net.guests[0].lobby.status(), GuestStatus::Starting);
+}
+
+#[test]
+fn path_table_routes_each_pair_the_same_way_from_both_ends() {
+    let real = |i: u8| Some(ep(10, 0, 0, i, 1337));
+    let mut seats: Vec<SeatInfo> = (0..10u8).map(SeatInfo::open).collect();
+    for (i, kind) in [
+        (0, SeatKind::Host),
+        (1, SeatKind::Network),
+        (2, SeatKind::Network),
+    ] {
+        seats[i] = SeatInfo {
+            kind,
+            name: format!("p{i}"),
+            addr: real(i as u8),
+            ..SeatInfo::open(i as u8)
+        };
+    }
+    // No relay room: every pair is direct, as in the spec.
+    let mut p = PathTable::default();
+    assert_eq!(p.route(0, 2, real(2)), real(2));
+    assert_eq!(p.unconnected(&seats), None);
+    // A relay room that seat 2 has not joined yet: 0-2 and 1-2 are unconnected.
+    p.relay = Some((ep(9, 9, 9, 9, 3479), 5));
+    let seat = |member| {
+        Some(RelaySeat {
+            member,
+            game_port: 1337 + u16::from(member),
+        })
+    };
+    p.members[0] = seat(0);
+    p.members[1] = seat(1);
+    assert_eq!(p.unconnected(&seats), Some((0, 2)));
+    p.members[2] = seat(2);
+    assert_eq!(p.unconnected(&seats), None);
+    // 0 and 1 heard each other: direct. 2 heard 0, but 0 did not hear 2: relayed.
+    p.heard[0] = 0b010;
+    p.heard[1] = 0b001;
+    p.heard[2] = 0b001;
+    assert!(p.direct(0, 1) && p.direct(1, 0));
+    assert!(p.relayed(0, 2) && p.relayed(2, 0) && p.relayed(1, 2));
+    assert_eq!(p.route(0, 1, real(1)), real(1));
+    assert_eq!(p.route(1, 0, real(0)), real(0));
+    assert_eq!(
+        p.route(0, 2, real(2)),
+        Some(crate::relay::peer_endpoint(2, 1339))
+    );
+    assert_eq!(
+        p.route(2, 0, real(0)),
+        Some(crate::relay::peer_endpoint(0, 1337))
+    );
+    assert_eq!(
+        p.route(2, 1, real(1)),
+        Some(crate::relay::peer_endpoint(1, 1338))
+    );
+}
+
+#[test]
+fn host_collects_the_path_table_and_freezes_it_at_launch() {
+    let mut net = Net::new(host_cfg());
+    net.add("Ann");
+    net.add("Bob");
+    net.run_until(20_000, |n| n.guests.iter().all(G::seated));
+    let room = Some((ep(9, 9, 9, 9, 3479), 5));
+    let now = net.now;
+    let s = net.host.set_relay(now, room, Some(0));
+    net.host_step(s);
+    let s = net.host.set_heard(now, 0b010);
+    net.host_step(s);
+    // Ann punched with the host; Bob reaches everyone through the relay only.
+    for (i, member, heard) in [(0, 1, 0b001), (1, 2, 0)] {
+        let s = net.guests[i].lobby.set_paths(now, Some(member), heard);
+        net.guest_step(i, s);
+        let s = net.guests[i].lobby.set_ready(now, true);
+        net.guest_step(i, s);
+    }
+    net.run_until(5_000, |n| n.host.start_blocker().is_none());
+    assert_eq!(net.host.start_blocker(), None);
+    let paths = net.host.view().paths.clone();
+    assert!(paths.direct(0, 1) && paths.relayed(0, 2) && paths.relayed(1, 2));
+    let s = net.host.start(net.now, 1).unwrap();
+    net.host_step(s);
+    // Changes after the start are ignored: the table is frozen.
+    let s = net.host.set_heard(net.now, 0b110);
+    net.host_step(s);
+    let s = net.guests[1].lobby.set_paths(net.now, Some(2), 0b001);
+    net.guest_step(1, s);
+    net.run_until(5_000, |n| n.guests.iter().all(|g| g.started().is_some()));
+    assert_eq!(net.host.view().paths, paths);
+    let relayed = |member: u8, port: u16| crate::relay::peer_endpoint(member, port);
+    let ann = net.guests[0].started().unwrap();
+    let bob = net.guests[1].started().unwrap();
+    assert_eq!(ann.paths, paths);
+    assert_eq!(bob.paths, paths);
+    assert_eq!(
+        ann.endpoint_of(PlayerId(0)),
+        Some(SocketAddrV4::new(*host_addr().ip(), GAME_PORT))
+    );
+    assert_eq!(ann.endpoint_of(PlayerId(2)), Some(relayed(2, GAME_PORT)));
+    assert_eq!(bob.endpoint_of(PlayerId(0)), Some(relayed(0, GAME_PORT)));
+    assert_eq!(bob.endpoint_of(PlayerId(1)), Some(relayed(1, GAME_PORT)));
 }

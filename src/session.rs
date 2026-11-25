@@ -352,6 +352,8 @@ pub struct LobbyView {
     pub approval_required: bool,
     /// Tail of the room chat (at most 8 lines).
     pub chat: Vec<ChatLine>,
+    /// How each pair of human seats reaches the other (see [`PathTable`]).
+    pub paths: PathTable,
 }
 
 impl LobbyView {
@@ -368,6 +370,110 @@ impl LobbyView {
             .iter()
             .find(|s| s.kind == SeatKind::Open)
             .map(|s| s.index)
+    }
+}
+
+/// A seat's place in the room's relay room: its member index and the local game port its
+/// relayed game datagrams are addressed to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelaySeat {
+    pub member: u8,
+    pub game_port: u16,
+}
+
+impl RelaySeat {
+    /// The synthetic endpoint other members reach this seat's game socket at.
+    pub fn endpoint(self) -> Endpoint {
+        crate::relay::peer_endpoint(self.member, self.game_port)
+    }
+}
+
+/// How the human seats of one room reach each other, pair by pair. Announced by the host
+/// (it collects every guest's part from its claims) and frozen when the launch starts, so
+/// every peer derives the same addressing from the same table.
+///
+/// Without a relay room every pair is direct (the seat addresses), as in the spec. Once
+/// the host has a relay room, every human peer joins it too, and a pair is:
+///
+/// * **direct** when each of the two has heard a punch from the other (`heard`), at the
+///   seat addresses;
+/// * otherwise **relayed** when both are relay members, at their synthetic endpoints;
+/// * otherwise unconnected: the host cannot start ([`StartBlocker::Unconnected`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathTable {
+    /// The relay and room every human peer joins, once the host has opened one.
+    pub relay: Option<(Endpoint, crate::relay::RoomId)>,
+    /// Per seat: its relay membership, once it has joined the room.
+    pub members: [Option<RelaySeat>; SEATS],
+    /// Per seat: a bit per seat it has heard a punch from (bit `j` = seat `j`).
+    pub heard: [u16; SEATS],
+}
+
+impl PathTable {
+    fn member(&self, seat: u8) -> Option<RelaySeat> {
+        self.members.get(usize::from(seat)).copied().flatten()
+    }
+
+    fn heard_by(&self, seat: u8, other: u8) -> bool {
+        other < 16
+            && self
+                .heard
+                .get(usize::from(seat))
+                .is_some_and(|m| m & (1 << other) != 0)
+    }
+
+    /// Each of `a` and `b` has heard a punch from the other.
+    pub fn direct(&self, a: u8, b: u8) -> bool {
+        self.heard_by(a, b) && self.heard_by(b, a)
+    }
+
+    /// Both `a` and `b` are members of the relay room.
+    pub fn relayable(&self, a: u8, b: u8) -> bool {
+        self.relay.is_some() && self.member(a).is_some() && self.member(b).is_some()
+    }
+
+    /// Whether the pair goes through the relay.
+    pub fn relayed(&self, a: u8, b: u8) -> bool {
+        self.relay.is_some() && !self.direct(a, b) && self.relayable(a, b)
+    }
+
+    /// Where `me` sends to seat `other`, whose seat address is `addr`: the synthetic
+    /// endpoint for a relayed pair, else the seat address. The same answer on every peer.
+    pub fn route(&self, me: u8, other: u8, addr: Option<Endpoint>) -> Option<Endpoint> {
+        if self.relayed(me, other) {
+            self.member(other).map(RelaySeat::endpoint)
+        } else {
+            addr
+        }
+    }
+
+    /// A pair of human seats that can reach each other neither directly nor through the
+    /// relay room, while there is one.
+    pub fn unconnected(&self, seats: &[SeatInfo]) -> Option<(u8, u8)> {
+        self.relay?;
+        let humans: Vec<u8> = seats
+            .iter()
+            .filter(|s| s.kind.is_human())
+            .map(|s| s.index)
+            .collect();
+        for (i, a) in humans.iter().enumerate() {
+            for b in humans.iter().skip(i + 1) {
+                if !self.direct(*a, *b) && !self.relayable(*a, *b) {
+                    return Some((*a, *b));
+                }
+            }
+        }
+        None
+    }
+
+    /// Forget a seat that was freed.
+    pub(crate) fn clear_seat(&mut self, seat: u8) {
+        if let Some(m) = self.members.get_mut(usize::from(seat)) {
+            *m = None;
+        }
+        if let Some(h) = self.heard.get_mut(usize::from(seat)) {
+            *h = 0;
+        }
     }
 }
 
@@ -390,6 +496,8 @@ pub struct GameStart {
     pub peers: Vec<(PlayerId, Endpoint)>,
     /// The game port this peer should bind (the same port as the lobby used).
     pub local_game_port: u16,
+    /// The frozen path table `peers` was derived from (kept for a rejoin offer).
+    pub paths: PathTable,
 }
 
 impl GameStart {
@@ -443,7 +551,11 @@ impl GameStart {
         let peers = seats
             .iter()
             .filter(|s| s.kind.is_human() && s.index != my_seat)
-            .filter_map(|s| s.addr.map(|a| (PlayerId(s.index), a)))
+            .filter_map(|s| {
+                view.paths
+                    .route(my_seat, s.index, s.addr)
+                    .map(|a| (PlayerId(s.index), a))
+            })
             .collect();
         Some(Self {
             session: view.session,
@@ -459,6 +571,7 @@ impl GameStart {
             seats,
             peers,
             local_game_port,
+            paths: view.paths.clone(),
         })
     }
 }
@@ -535,6 +648,8 @@ pub enum StartBlocker {
     NoMap,
     WaitingForReady(String),
     WaitingForPlayer,
+    /// Two players reach each other neither directly nor through the relay room yet.
+    Unconnected(String, String),
 }
 
 impl fmt::Display for StartBlocker {
@@ -543,6 +658,9 @@ impl fmt::Display for StartBlocker {
             Self::NoMap => write!(f, "Select a map"),
             Self::WaitingForReady(n) => write!(f, "Waiting for {n} to be ready"),
             Self::WaitingForPlayer => write!(f, "Waiting for another player to join"),
+            Self::Unconnected(a, b) => {
+                write!(f, "Waiting for {a} and {b} to reach each other")
+            }
         }
     }
 }
@@ -763,6 +881,7 @@ pub fn read_announcement(from: Endpoint, bytes: &[u8]) -> Option<HeardGame> {
             launching: a.launching,
             approval_required: a.approval,
             chat: a.chat,
+            paths: a.paths,
         },
         build_id: a.build,
         game_port: a.game_port,
