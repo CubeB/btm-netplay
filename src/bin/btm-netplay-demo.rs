@@ -6,6 +6,10 @@
 //! btm-netplay-demo lan [ip[:port]] [--seconds S]
 //! ```
 //!
+//! With `--mods <dir>` (repeatable; build with `--features mods`) the mod directories are
+//! resolved with btm-mod and the result is the lobby's mod set, so a guest whose set
+//! differs is refused with the differing mods named.
+//!
 //! Run with `--help` for every option. Lines typed on stdin are room or game chat;
 //! `/start`, `/accept [name]`, `/requests`, `/relay` (host), `/ready`, `/unready` (guest)
 //! and `/quit` are commands; a reply code typed by the host pre-approves that player.
@@ -41,6 +45,11 @@ Options:
   --relay-always       host: use the relay from the start
   --drop-timeout S     seconds of silence before a player is dropped (default 10)
   --seconds S          lan: how long to listen (default 10)
+  --mods DIR           a mod directory to resolve into the lobby's mod set (repeatable;
+                       needs a build with --features mods)
+  --engine V           engine version the mods are resolved against (default 0.4.0)
+  --interface N=V      a built-in interface and its version (repeatable)
+  --phases A,B,...     the built-in tick phases, in order
 
 Typed lines: chat, or /start /accept [name] /requests /relay /invite (host),
 /ready /unready (guest), /quit. A reply code typed by the host pre-approves that player.";
@@ -53,6 +62,16 @@ struct Args {
     desync_at: Option<u32>,
     auto_start: Option<usize>,
     seconds: u64,
+    mods: ModArgs,
+}
+
+/// What `--mods` and its companions asked for.
+#[derive(Debug, Default)]
+struct ModArgs {
+    dirs: Vec<String>,
+    engine: Option<String>,
+    interfaces: Vec<String>,
+    phases: Option<String>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -75,6 +94,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut relay_always = false;
     let mut drop_timeout = None;
     let mut seconds = 10;
+    let mut mods = ModArgs::default();
     fn val<'a>(it: &mut impl Iterator<Item = &'a String>, flag: &str) -> Result<String, String> {
         it.next()
             .cloned()
@@ -106,6 +126,10 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--relay-always" => relay_always = true,
             "--drop-timeout" => drop_timeout = Some(num::<u64>(&val(&mut it, a)?, a)?),
             "--seconds" => seconds = num(&val(&mut it, a)?, a)?,
+            "--mods" => mods.dirs.push(val(&mut it, a)?),
+            "--engine" => mods.engine = Some(val(&mut it, a)?),
+            "--interface" => mods.interfaces.push(val(&mut it, a)?),
+            "--phases" => mods.phases = Some(val(&mut it, a)?),
             s if s.starts_with("--") => return Err(format!("Unknown option {s}.")),
             s => positional.push(s.to_owned()),
         }
@@ -145,7 +169,68 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         desync_at,
         auto_start,
         seconds,
+        mods,
     })
+}
+
+/// The lobby's mod set for `--mods`: nothing asked for gives the empty default.
+#[cfg(not(feature = "mods"))]
+fn load_mods(args: &ModArgs) -> Result<btm_netplay::session::ModSet, String> {
+    if args.dirs.is_empty() {
+        return Ok(btm_netplay::session::ModSet::default());
+    }
+    Err("--mods needs a build with --features mods.".to_owned())
+}
+
+/// The lobby's mod set for `--mods`: the directories resolved with btm-mod. Nothing asked
+/// for gives the empty default.
+#[cfg(feature = "mods")]
+fn load_mods(args: &ModArgs) -> Result<btm_netplay::session::ModSet, String> {
+    use btm_netplay::session::{ModEntry, ModSet};
+    use std::collections::BTreeMap;
+
+    if args.dirs.is_empty() {
+        return Ok(ModSet::default());
+    }
+    let engine = args.engine.as_deref().unwrap_or("0.4.0");
+    let mut interfaces = BTreeMap::new();
+    for spec in &args.interfaces {
+        let (name, ver) = spec
+            .split_once('=')
+            .ok_or_else(|| format!("--interface needs name=version, not \"{spec}\"."))?;
+        let ver = ver
+            .parse()
+            .map_err(|e| format!("--interface \"{spec}\": {e}."))?;
+        interfaces.insert(name.to_owned(), ver);
+    }
+    let env = btm_mod::Environment {
+        engine: engine
+            .parse()
+            .map_err(|e| format!("--engine \"{engine}\": {e}."))?,
+        interfaces,
+        phases: args
+            .phases
+            .as_deref()
+            .map(|p| p.split(',').map(str::to_owned).collect())
+            .unwrap_or_default(),
+    };
+    let mut packages = Vec::new();
+    for dir in &args.dirs {
+        packages
+            .push(btm_mod::fs::load_package(std::path::Path::new(dir)).map_err(|e| e.to_string())?);
+    }
+    let set = btm_mod::resolve(&packages, &env, &BTreeMap::new()).map_err(|e| e.to_string())?;
+    let lobby = set.to_lobby().map_err(|e| e.to_string())?;
+    let entries = lobby
+        .mods
+        .into_iter()
+        .map(|m| ModEntry {
+            id: m.id,
+            version: m.version,
+            hash: m.hash,
+        })
+        .collect();
+    ModSet::new(lobby.hash, entries).map_err(|e| e.to_string())
 }
 
 fn status_line(node: &Node, s: &Stats) -> String {
@@ -207,7 +292,8 @@ fn write_dump(d: &btm_netplay::lockstep::Desync, build: &str) -> Option<String> 
     std::fs::write(&name, json).ok().map(|()| name)
 }
 
-fn run(args: Args) -> Result<(), String> {
+fn run(mut args: Args) -> Result<(), String> {
+    args.cfg.mods = load_mods(&args.mods)?;
     let build = String::from_utf8_lossy(&args.cfg.build_id).into_owned();
     let browse = matches!(args.role, Role::Browse(_));
     let mut node = Node::new(args.cfg, args.role).map_err(|e| e.to_string())?;

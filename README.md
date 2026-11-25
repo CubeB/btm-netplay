@@ -33,6 +33,7 @@ target/release/btm-netplay-demo join BTM-XXXX-XXXX-XXXXX --name B
 - **On one LAN:** use `--no-stun` and `join <ip>`. `btm-netplay-demo lan` lists the games it finds.
 - **If punching fails** (symmetric NAT): run `btm-relay --bind 0.0.0.0:PORT` somewhere reachable, pass `--relay ip:port` to the host, and the host shows a relay code instead. See `RELAY.md`.
 - **Rejoining:** a guest whose game dropped it runs the same `join` again. The host offers the seat back, sends the game so far, and the guest fast-forwards and plays on.
+- **Mods:** build with `--features mods` and pass `--mods <dir>` (repeat it for each mod directory) to `host` and `join`. The directories are resolved with [btm-mod](https://github.com/CubeB/btm-mod), and the resolved set is the lobby's mod set. A guest whose set differs is refused, and the refusal names the mods that differ. `--engine V` (default 0.4.0), `--interface NAME=V` and `--phases A,B` describe the engine the mods resolve against. The library itself stays std-only; btm-mod is an optional dependency used only by the demo.
 - **Testing the failure paths:**
   - `--ticks N` ends the game after N ticks.
   - `--build-id X` triggers the mismatch refusal.

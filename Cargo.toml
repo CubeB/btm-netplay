@@ -14,7 +14,13 @@ path = "src/bin/btm-relay.rs"
 name = "btm-netplay-demo"
 path = "src/bin/btm-netplay-demo.rs"
 
+[features]
+# Resolve mod directories with btm-mod for the demo's `--mods`. The library itself never
+# uses it and stays std-only.
+mods = ["dep:btm-mod"]
+
 [dependencies]
+btm-mod = { git = "https://github.com/CubeB/btm-mod", rev = "b8d4414", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"
