@@ -16,6 +16,31 @@ It is a host-side package: it never touches game logic, and it drives any engine
 
 This is a clean-room implementation, under MIT. Its behaviour comes from a written spec (`SPEC.md`) of [RWE-B4](https://github.com/CubeB/RWE-B4)'s multiplayer, which is GPLv3 and field-proven. The spec was written by someone who read RWE. The code was written only from the spec, by someone who never read RWE's source. No RWE code is in this repository.
 
+## Try it: the demo
+
+`btm-netplay-demo` runs a toy deterministic game, so you can test the connection with a friend before the engine exists.
+
+```sh
+cargo build --release
+# Machine A
+target/release/btm-netplay-demo host --name A        # prints an invite code: BTM-XXXX-XXXX-XXXXX
+# Machine B
+target/release/btm-netplay-demo join BTM-XXXX-XXXX-XXXXX --name B
+```
+
+- If B hears nothing within about 2 s, it prints a **reply code**. Type it on A, which approves B. Otherwise A types `/accept`.
+- A types `/start`. Every second, each side prints the tick, the round trip, the input delay, stalls, and who is being waited for. Lines typed on stdin are sent as chat.
+- **On one LAN:** use `--no-stun` and `join <ip>`. `btm-netplay-demo lan` lists the games it finds.
+- **If punching fails** (symmetric NAT): run `btm-relay --bind 0.0.0.0:PORT` somewhere reachable, pass `--relay ip:port` to the host, and the host shows a relay code instead. See `RELAY.md`.
+- **Testing the failure paths:**
+  - `--ticks N` ends the game after N ticks.
+  - `--build-id X` triggers the mismatch refusal.
+  - `--desync-at T` forces a desync report at tick T.
+
 ## Status
 
-Work in progress. See `SPEC.md` and the issues.
+Work in progress. Not yet wired into an engine. Known gaps:
+
+- rejoin isn't driven by the socket layer yet;
+- a game that mixes direct and relayed peers can't connect them;
+- IPv6 isn't supported.
