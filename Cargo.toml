@@ -1,0 +1,17 @@
+[package]
+name = "btm-netplay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Easy multiplayer for Byte Tactics: lockstep, invite codes with NAT punch, desync detection, drop and rejoin."
+repository = "https://github.com/CubeB/btm-netplay"
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
