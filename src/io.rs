@@ -107,7 +107,7 @@ use crate::session::rejoin::{
 use crate::session::{
     self, build_compatible, display_build, GameStart, GuestConfig, GuestEvent, GuestLobby,
     GuestStatus, HeardGame, HostConfig, HostError, HostEvent, HostLobby, JoinError, LobbyView,
-    MapInfo, PendingRequest, SeatKind, Step,
+    MapInfo, ModSet, PendingRequest, SeatKind, Step,
 };
 use crate::types::{Endpoint, Engine, Instant, Outgoing, PlayerId, Tick};
 use crate::wire::{ChatLabel, MAX_DATAGRAM};
@@ -187,6 +187,8 @@ pub struct NodeConfig {
     pub relay: Option<Endpoint>,
     /// Host: use the relay from the start.
     pub relay_always: bool,
+    /// This peer's resolved mod set; the host refuses a guest whose set differs.
+    pub mods: ModSet,
 }
 
 impl NodeConfig {
@@ -210,6 +212,7 @@ impl NodeConfig {
             auto_ready: true,
             relay: None,
             relay_always: false,
+            mods: ModSet::default(),
         }
     }
 }
@@ -1133,6 +1136,7 @@ impl<T: Transport> Node<T> {
         hc.game_port = game_port;
         hc.discovery_port = self.cfg.lan_port;
         hc.password = self.cfg.password.clone();
+        hc.mods = self.cfg.mods.clone();
         hc.game_addr = self.outside.map(|(_, g)| g);
         // Handing out an invite code turns on approval (2.9).
         hc.require_approval = self.outside.is_some();
@@ -1181,6 +1185,7 @@ impl<T: Transport> Node<T> {
         );
         gc.game_port = self.transport.local_port(Socket::Game).unwrap_or(0);
         gc.password = self.cfg.password.clone();
+        gc.mods = self.cfg.mods.clone();
         gc.maps = vec![self.cfg.map.clone()];
         gc.via_code = via_code;
         gc.approval = via_code || relayed;
