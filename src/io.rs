@@ -5,7 +5,9 @@
 //!
 //! 1. **Traversal**: STUN from both sockets ([`crate::nat::traversal::Traversal`]), skipped
 //!    with [`Stun::Off`]. A guest joining through a relay code connects to the relay here
-//!    instead. Traversal keeps running (keepalive, address drift, 2.4) until game start.
+//!    instead. A guest joining an address or a code skips this phase: its lobby probes the
+//!    host while STUN runs (2.6). Traversal keeps running (keepalive, address drift, 2.4)
+//!    until game start, and on the host through the game.
 //! 2. **Lobby**: a [`HostLobby`] or a [`GuestLobby`], with punching
 //!    ([`crate::nat::punch::Puncher`]) on the game socket; or, for [`Role::Browse`], LAN
 //!    discovery ([`crate::nat::lan`]) listing the games heard.
@@ -646,9 +648,10 @@ impl<T: Transport> Node<T> {
                     JoinVia::Direct { host, .. } => {
                         node.events
                             .push(Event::Status(format!("Connecting to {host}...")));
-                        if !node.start_traversal(now) {
-                            node.open_guest(now)?;
-                        }
+                        // STUN and the probes run in parallel (2.6): the lobby opens now
+                        // and gets this machine's outside addresses once STUN answers.
+                        node.start_traversal(now);
+                        node.open_guest(now)?;
                     }
                 }
             }
@@ -1933,15 +1936,19 @@ impl<T: Transport> Node<T> {
         }
     }
 
-    /// Traversal settled (or failed): open the lobby if it is not open yet.
+    /// Traversal settled (or failed): open the lobby if it is not open yet. A guest's lobby
+    /// is already probing (2.6); it gets the outside addresses for its claims now.
     fn after_traversal(&mut self, now: Instant) {
-        if self.phase != Phase::Traversal {
-            return;
-        }
         if let Some((d, _)) = self.outside {
             if self.join.is_some() {
                 self.reply_code = invite::encode_reply(d).ok();
             }
+        }
+        if self.phase != Phase::Traversal {
+            if self.outside.is_some() && matches!(self.lobby, Lobby::Guest(_)) {
+                self.push_guest_addrs(now);
+            }
+            return;
         }
         let opened = match self.role {
             Role::Host => self.open_host(now),

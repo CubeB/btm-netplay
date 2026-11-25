@@ -476,3 +476,40 @@ fn a_dropped_guest_rejoins_with_the_same_address_and_catches_up() {
     // The returning player's commands count again after the rejoin.
     assert!(game.peers[2].engine.commands_seen() > 50);
 }
+
+/// SPEC 2.6: a guest probes the host while its STUN probe is still waiting for an answer.
+#[test]
+fn a_guest_joins_while_its_stun_probe_is_still_out() {
+    // A STUN server that never answers: the probe times out only after 4 s.
+    let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let std::net::SocketAddr::V4(stun) = silent.local_addr().unwrap() else {
+        panic!()
+    };
+    let wait = Duration::from_secs(30);
+    let mut host = Peer::new("host", node(config("Host", wait), Role::Host, false), 1);
+    let disc = SocketAddrV4::new(
+        Ipv4Addr::LOCALHOST,
+        host.node.local_port(Socket::Discovery).unwrap(),
+    );
+    let mut cfg = config("Guest", wait);
+    cfg.stun = Stun::Servers(vec![stun]);
+    let mut guest = Peer::new("guest", node(cfg, Role::Join(disc.to_string()), false), 2);
+    assert_eq!(guest.node.phase(), Phase::Lobby);
+    let t0 = StdInstant::now();
+    while guest.node.guest_lobby().and_then(|g| g.my_seat()).is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(3), "{:?}", guest.log);
+        host.pump();
+        guest.pump();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Seated before STUN could have settled: nothing has failed or answered yet.
+    assert!(guest.node.reply_code().is_none());
+    assert!(
+        !guest
+            .log
+            .iter()
+            .any(|l| l.contains("No reply from the internet")),
+        "{:?}",
+        guest.log
+    );
+}
