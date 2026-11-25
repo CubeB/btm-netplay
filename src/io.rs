@@ -391,23 +391,26 @@ impl fmt::Display for Event {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Status(s) | Self::Notice(s) | Self::Log(s) => write!(f, "{s}"),
+            // Every code stands alone on its own line, so it is easy to select and copy
+            // (this crate does not touch the clipboard; SPEC 2.2 copies it).
             Self::InviteCode(c) => write!(
                 f,
-                "Invite code: {c}\n\
+                "Invite code:\n\
+                 {c}\n\
                  Send it to the player who wants to join; they paste it to join.\n\
                  If the game does not appear for them, they get a reply code: type it here.\n\
                  A code is good for this session only."
             ),
-            Self::InviteCodeChanged(c) => write!(f, "Your address changed. New invite code: {c}"),
-            Self::ReplyCode(c) => {
-                write!(
-                    f,
-                    "No answer yet. Reply code {c}; send it to the host if needed."
-                )
+            Self::InviteCodeChanged(c) => {
+                write!(f, "Your address changed. New invite code:\n{c}")
             }
+            Self::ReplyCode(c) => write!(
+                f,
+                "No answer yet. If the host does not see you, send them this reply code:\n{c}"
+            ),
             Self::RelayCode { code, relay } => write!(
                 f,
-                "Relay invite code: {code}\nThe game goes through the relay at {relay}."
+                "Relay invite code:\n{code}\nThe game goes through the relay at {relay}."
             ),
             Self::RelayFailed(s) => write!(f, "The relay cannot be used: {s}"),
             Self::TraversalFailed(t) => write!(f, "{t}"),
@@ -2038,7 +2041,7 @@ impl<T: Transport> Node<T> {
                     self.outside = self.outside.map(|(_, g)| (ep, g));
                     if let Ok(code) = invite::encode_reply(ep) {
                         self.events
-                            .push(Event::Log(format!("New reply code: {code}")));
+                            .push(Event::Log(format!("New reply code:\n{code}")));
                         self.reply_code = Some(code);
                     }
                     self.push_guest_addrs(now);
@@ -2480,7 +2483,7 @@ mod tests {
     fn event_sentences() {
         assert_eq!(
             Event::ReplyCode("BTM-X".into()).to_string(),
-            "No answer yet. Reply code BTM-X; send it to the host if needed."
+            "No answer yet. If the host does not see you, send them this reply code:\nBTM-X"
         );
         assert_eq!(
             Event::Host(HostEvent::HearingFrom("1.2.3.4:5".parse().unwrap())).to_string(),
@@ -2488,8 +2491,23 @@ mod tests {
         );
         assert_eq!(
             Event::InviteCodeChanged("C".into()).to_string(),
-            "Your address changed. New invite code: C"
+            "Your address changed. New invite code:\nC"
         );
+        // Each code is a line of its own, for copying.
+        for e in [
+            Event::InviteCode("BTM-1234-5678-9ABCD".into()),
+            Event::InviteCodeChanged("BTM-1234-5678-9ABCD".into()),
+            Event::ReplyCode("BTM-1234-5678-9ABCD".into()),
+            Event::RelayCode {
+                code: "BTM-1234-5678-9ABCD".into(),
+                relay: "1.2.3.4:3479".parse().unwrap(),
+            },
+        ] {
+            assert!(
+                e.to_string().lines().any(|l| l == "BTM-1234-5678-9ABCD"),
+                "{e}"
+            );
+        }
         assert_eq!(
             Event::NoGamesFound.to_string(),
             "No games found on this network."

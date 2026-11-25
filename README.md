@@ -43,3 +43,6 @@ target/release/btm-netplay-demo join BTM-XXXX-XXXX-XXXXX --name B
 Work in progress. Not yet wired into an engine. Known gaps:
 
 - IPv6 isn't supported.
+- Codes aren't copied to the clipboard (that would need a dependency). Each code is printed on a line of its own instead.
+- Rejoin goes through the host, so a dropped host can't come back. The returning machine is found again by address following, so it has to keep its /16 (as a machine that just restarted does), or the pair has to go through the relay.
+- Name lookups aren't cached. Each node does at most one host-name lookup plus one for the STUN servers.
