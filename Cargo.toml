@@ -10,6 +10,10 @@ repository = "https://github.com/CubeB/btm-netplay"
 name = "btm-relay"
 path = "src/bin/btm-relay.rs"
 
+[[bin]]
+name = "btm-netplay-demo"
+path = "src/bin/btm-netplay-demo.rs"
+
 [dependencies]
 
 [lints.rust]

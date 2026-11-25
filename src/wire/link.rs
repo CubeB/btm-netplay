@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use super::codec::{
     chat_size, encode_message, seal, set_size, update_header_size, ChatLine, Chunk, Message, Relay,
-    RunState, SharedPause, Update, WireError, CHUNK_OVERHEAD, HASH_SIZE, MAX_PAYLOAD,
+    RunState, SharedPause, Update, WireError, CHUNK_OVERHEAD, HASH_SIZE, MAX_DATAGRAM, MAX_PAYLOAD,
     RELAY_OVERHEAD,
 };
 use crate::types::{Instant, PlayerId};
@@ -282,6 +282,8 @@ pub struct Link {
     dirty: bool,
     packet_id: u32,
     last_new_commands: Option<Instant>,
+    /// Largest encoded update this link builds (before the CRC).
+    max_payload: usize,
 }
 
 impl Link {
@@ -300,7 +302,21 @@ impl Link {
             dirty: true,
             packet_id: 0,
             last_new_commands: None,
+            max_payload: MAX_PAYLOAD,
         }
+    }
+
+    /// Cap the datagrams this link builds at `max_datagram` bytes including the CRC (for
+    /// example a relay's `max_payload`). Values above [`MAX_DATAGRAM`] are clamped; the
+    /// default is [`MAX_DATAGRAM`].
+    pub fn with_max_datagram(mut self, max_datagram: usize) -> Self {
+        self.max_payload = max_datagram.min(MAX_DATAGRAM).saturating_sub(4);
+        self
+    }
+
+    /// The datagram cap, including the CRC.
+    pub fn max_datagram(&self) -> usize {
+        self.max_payload + 4
     }
 
     pub fn push_command(&mut self, set: Vec<u8>) -> u32 {
@@ -400,7 +416,8 @@ impl Link {
             held: header.held,
             relay: None,
         };
-        let mut budget = MAX_PAYLOAD
+        let mut budget = self
+            .max_payload
             .saturating_sub(update_header_size(&update))
             .saturating_sub(3 * CHUNK_OVERHEAD)
             .saturating_sub(RELAY_OVERHEAD);

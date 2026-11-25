@@ -275,6 +275,23 @@ fn caps() {
     };
     assert_eq!(u.commands.items.len(), 2);
 
+    // A per-link cap (a relayed peer) is honoured, chat and hashes included.
+    let mut a = Link::new(0, 0).with_max_datagram(1400);
+    assert_eq!(a.max_datagram(), 1400);
+    for i in 0..50u32 {
+        a.push_command(vec![7; 300]);
+        a.push_hash(i);
+        a.push_chat(ChatLine {
+            text: vec![b'x'; 100],
+            ..ChatLine::default()
+        })
+        .ok();
+    }
+    let built = a.build(at(0), header(0));
+    assert!(built.bytes.len() <= 1400, "{}", built.bytes.len());
+    assert!(built.bytes.len() > 1000);
+    assert!(built.error.is_none());
+
     // A set that can never fit is reported.
     let mut a = Link::new(0, 0);
     a.push_command(vec![1; 1600]);

@@ -103,6 +103,10 @@ pub struct Config {
     pub record: bool,
     /// Initial game speed, per mille.
     pub speed: u16,
+    /// Per remote player, the largest datagram (CRC included) to send it, for a peer
+    /// reached through a relay (its `max_payload`). Unlisted players get
+    /// [`crate::wire::MAX_DATAGRAM`].
+    pub max_datagram: Vec<(PlayerId, usize)>,
 }
 
 impl Config {
@@ -113,6 +117,7 @@ impl Config {
             drop_timeout: DEFAULT_DROP_TIMEOUT,
             record: true,
             speed: 1000,
+            max_datagram: Vec::new(),
         }
     }
 }
@@ -366,18 +371,25 @@ struct Peer {
     recent: VecDeque<Vec<u8>>,
     /// The peer's last reported sets held per player.
     held: Vec<(PlayerId, u32)>,
+    /// Datagram cap for this peer's link (CRC included).
+    max_datagram: usize,
 }
 
 impl Peer {
-    fn new(c: &PlayerConfig, local: bool) -> Self {
+    fn new(c: &PlayerConfig, local: bool, max_datagram: usize) -> Self {
         Peer {
+            max_datagram,
             id: c.id,
             name: c.name.clone(),
             endpoint: if local { None } else { c.endpoint },
             buffer: VecDeque::new(),
             pushed: 0,
             dropped_from: None,
-            link: if local { None } else { Some(Link::new(0, 0)) },
+            link: if local {
+                None
+            } else {
+                Some(Link::new(0, 0).with_max_datagram(max_datagram))
+            },
             last_heard: None,
             report: None,
             grace_until: None,
@@ -481,7 +493,12 @@ impl Lockstep {
             if !local && p.endpoint.is_none() {
                 return Err(ConfigError::RemoteWithoutEndpoint(p.id));
             }
-            peers.push(Peer::new(p, local));
+            let cap = config
+                .max_datagram
+                .iter()
+                .find(|(id, _)| *id == p.id)
+                .map_or(crate::wire::MAX_DATAGRAM, |(_, n)| *n);
+            peers.push(Peer::new(p, local, cap));
             hashes.add_source(p.id, 1);
         }
         let speed = config.speed.max(1);
@@ -538,7 +555,7 @@ impl Lockstep {
         let mut ls = Lockstep::new(config)?;
         for p in &mut ls.peers {
             if p.link.is_some() {
-                p.link = Some(Link::new(r - 1, r - 1));
+                p.link = Some(Link::new(r - 1, r - 1).with_max_datagram(p.max_datagram));
             }
             ls.hashes.add_source(p.id, r);
         }
@@ -1470,7 +1487,7 @@ impl Lockstep {
                 }
                 continue;
             }
-            let mut link = Link::new(start, start);
+            let mut link = Link::new(start, start).with_max_datagram(p.max_datagram);
             for seq in start..own_pushed {
                 if let Some(s) = self.history.get((seq - base) as usize) {
                     link.push_command(s.clone());

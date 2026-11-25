@@ -722,5 +722,59 @@ pub(crate) fn since(now: Instant, then: Instant) -> Duration {
     now.0.saturating_sub(then.0)
 }
 
+/// A host announcement heard on the discovery socket, as a game list shows it (2.10).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeardGame {
+    /// The room. The host seat's address is the announcement's source IP with its game port.
+    pub view: LobbyView,
+    /// The host's build identity (see [`build_compatible`] and [`display_build`]).
+    pub build_id: Vec<u8>,
+    pub game_port: u16,
+    /// The room asks for a password.
+    pub password: bool,
+}
+
+/// Read a host announcement from a discovery-socket datagram, for a game list (2.10).
+/// `None` if the datagram is anything else.
+pub fn read_announcement(from: Endpoint, bytes: &[u8]) -> Option<HeardGame> {
+    let codec::Msg::Announce(a) = codec::decode(bytes).ok()? else {
+        return None;
+    };
+    let mut seats: Vec<SeatInfo> = (0..SEATS as u8).map(SeatInfo::open).collect();
+    for s in &a.seats {
+        if let Some(slot) = seats.get_mut(usize::from(s.index)) {
+            *slot = s.clone();
+        }
+    }
+    if let Some(s) = seats.first_mut() {
+        if s.kind == SeatKind::Host {
+            s.addr = Some(SocketAddrV4::new(*from.ip(), a.game_port));
+        }
+    }
+    Some(HeardGame {
+        view: LobbyView {
+            session: a.session,
+            label: a.label,
+            host_name: a.host_name,
+            map: a.map,
+            options: a.options,
+            seats,
+            epoch: a.epoch,
+            launching: a.launching,
+            approval_required: a.approval,
+            chat: a.chat,
+        },
+        build_id: a.build,
+        game_port: a.game_port,
+        password: a.challenge.is_some(),
+    })
+}
+
+/// The probe a game list sends to ask a host to announce to it (2.10). A [`HostLobby`]
+/// answers it with its announcement.
+pub fn probe_datagram(build_id: &[u8]) -> Vec<u8> {
+    codec::encode_probe(build_id)
+}
+
 #[cfg(test)]
 mod tests;

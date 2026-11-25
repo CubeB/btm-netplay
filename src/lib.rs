@@ -9,6 +9,7 @@
 pub mod types;
 
 pub mod invite;
+pub mod io;
 pub mod lockstep;
 pub mod nat;
 pub mod relay;
