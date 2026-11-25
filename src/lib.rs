@@ -11,5 +11,6 @@ pub mod types;
 pub mod invite;
 pub mod lockstep;
 pub mod nat;
+pub mod relay;
 pub mod session;
 pub mod wire;
