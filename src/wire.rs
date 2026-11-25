@@ -8,8 +8,9 @@ mod link;
 
 pub use codec::{
     chat_size, decode_datagram, decode_message, encode_datagram, encode_message, open, seal,
-    set_size, varint_len, ChatLabel, ChatLine, Chunk, LoadStatus, Message, Reader, RunState,
-    SharedPause, Update, WireError, Writer, MAX_DATAGRAM, MAX_PAYLOAD, MAX_SEATS, VERSION,
+    set_size, varint_len, ChatLabel, ChatLine, Chunk, LoadStatus, Message, Reader, Relay, RunState,
+    SharedPause, Update, WireError, Writer, MAX_DATAGRAM, MAX_PAYLOAD, MAX_SEATS, RELAY_OVERHEAD,
+    VERSION,
 };
 pub use crc::crc32;
 pub use link::{

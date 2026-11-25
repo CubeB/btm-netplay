@@ -182,7 +182,23 @@ pub struct Update {
     pub commands: Chunk<Vec<u8>>,
     pub hashes: Chunk<u32>,
     pub chat: Chunk<ChatLine>,
+    /// For each player, how many of its sets the sender holds (pushed so far).
+    /// Used to agree a drop cut and to relay a lost player's sets (lockstep 5.4).
+    pub held: Vec<(PlayerId, u32)>,
+    /// Best-effort relay of another player's sets, for a survivor that lacks them.
+    pub relay: Option<Relay>,
 }
+
+/// Sets of `player`'s stream, numbers `first..`, forwarded by a third peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relay {
+    pub player: PlayerId,
+    pub first: u32,
+    pub sets: Vec<Vec<u8>>,
+}
+
+/// Worst-case encoded size of a relay's fixed fields.
+pub const RELAY_OVERHEAD: usize = 1 + 1 + 5 + 5;
 
 impl Default for Update {
     fn default() -> Self {
@@ -195,6 +211,8 @@ impl Default for Update {
             commands: Chunk::default(),
             hashes: Chunk::default(),
             chat: Chunk::default(),
+            held: Vec::new(),
+            relay: None,
         }
     }
 }
@@ -383,6 +401,11 @@ fn write_header(w: &mut Writer, u: &Update) {
     w.varint(u64::from(u.pause.revision));
     w.u8(u.pause.player.0);
     w.varint(u64::from(u.ack_delay_ms));
+    w.varint(u.held.len() as u64);
+    for (p, n) in &u.held {
+        w.u8(p.0);
+        w.varint(u64::from(*n));
+    }
 }
 
 fn write_update(w: &mut Writer, u: &Update) {
@@ -408,6 +431,19 @@ fn write_update(w: &mut Writer, u: &Update) {
         w.bytes(&c.text);
         w.u8(c.label.to_byte());
     }
+
+    match &u.relay {
+        None => w.u8(0),
+        Some(r) => {
+            w.u8(1);
+            w.u8(r.player.0);
+            w.varint(u64::from(r.first));
+            w.varint(r.sets.len() as u64);
+            for s in &r.sets {
+                w.bytes(s);
+            }
+        }
+    }
 }
 
 fn read_update(r: &mut Reader<'_>) -> Result<Update, WireError> {
@@ -424,6 +460,15 @@ fn read_update(r: &mut Reader<'_>) -> Result<Update, WireError> {
     let revision = r.u32v("pause revision")?;
     let pause_player = r.seat()?;
     let ack_delay_ms = r.u32v("ack delay")?;
+    let n = r.count(2)?;
+    if n > usize::from(MAX_SEATS) {
+        return Err(WireError::BadValue("held count"));
+    }
+    let mut held = Vec::with_capacity(n);
+    for _ in 0..n {
+        let p = r.seat()?;
+        held.push((p, r.u32v("held")?));
+    }
 
     let first = r.u32v("command seq")?;
     let ack = r.u32v("command ack")?;
@@ -466,6 +511,25 @@ fn read_update(r: &mut Reader<'_>) -> Result<Update, WireError> {
         items: lines,
     };
 
+    let relay = match r.u8()? {
+        0 => None,
+        1 => {
+            let player = r.seat()?;
+            let first = r.u32v("relay seq")?;
+            let n = r.count(1)?;
+            let mut sets = Vec::with_capacity(n);
+            for _ in 0..n {
+                sets.push(r.bytes()?.to_vec());
+            }
+            Some(Relay {
+                player,
+                first,
+                sets,
+            })
+        }
+        _ => return Err(WireError::BadValue("relay flag")),
+    };
+
     Ok(Update {
         sender,
         packet_id,
@@ -486,6 +550,8 @@ fn read_update(r: &mut Reader<'_>) -> Result<Update, WireError> {
         commands,
         hashes,
         chat,
+        held,
+        relay,
     })
 }
 

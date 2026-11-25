@@ -59,15 +59,21 @@ fn sample_update() -> Update {
                 label: ChatLabel::Allies,
             }],
         },
+        held: vec![(PlayerId(0), 5), (PlayerId(9), 70_000)],
+        relay: Some(Relay {
+            player: PlayerId(1),
+            first: 40,
+            sets: vec![vec![], vec![9; 20]],
+        }),
     }
 }
 
 fn header(sender: u8) -> Header {
-    Header {
-        sender: PlayerId(sender),
-        run: RunState::default(),
-        pause: SharedPause::default(),
-    }
+    Header::new(
+        PlayerId(sender),
+        RunState::default(),
+        SharedPause::default(),
+    )
 }
 
 #[test]
@@ -154,15 +160,16 @@ fn huge_counts_are_refused_before_allocating() {
     w.u8(VERSION);
     w.u8(2);
     w.u8(0); // sender
-    for _ in 0..4 {
-        w.varint(0);
+    for _ in 0..5 {
+        w.varint(0); // packet id, scene, speed, chosen, capacity
     }
     w.u8(0); // flags
-    w.varint(0);
-    w.u8(0);
-    w.varint(0);
-    w.varint(0);
-    w.varint(0);
+    w.varint(0); // pause revision
+    w.u8(0); // pause player
+    w.varint(0); // ack delay
+    w.varint(0); // held count
+    w.varint(0); // first command
+    w.varint(0); // command ack
     w.varint(u64::from(u32::MAX)); // command count
     assert_eq!(decode_message(&w.finish()), Err(WireError::Truncated));
 }

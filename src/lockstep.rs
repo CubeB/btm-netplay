@@ -13,6 +13,16 @@
 //!   silent past the drop timeout, the next-lowest survivor declares after its own
 //!   timeout. To make that possible a drop is accepted from any undropped peer other
 //!   than the lost one (the spec requires exactly the designated declarer).
+//! - **Deviation (identical drop cut under loss):** a lost player's last sets may
+//!   reach only some survivors. Every update therefore reports how many sets the
+//!   sender holds for each player, and survivors relay a player's sets (silent for
+//!   [`RELAY_AFTER`], or dropped) to any survivor reporting fewer. The declarer
+//!   issues only once it holds at least as many as every survivor it still hears
+//!   reports, and the drop carries that count M: every survivor's stream for the
+//!   player becomes exactly its real sets `0..M` (fetched by relay where missing,
+//!   truncated where beyond), then empty sets up to `from - 1`. A survivor runs the
+//!   dropped player's ticks only once its cut is complete, so M is at least the
+//!   highest set any survivor ran, and every survivor applies the same history.
 
 mod bundle;
 mod commands;
@@ -63,6 +73,12 @@ pub const GOVERNOR_FLOOR: u16 = 100;
 pub const GOVERNOR_RECOVERY_PER_S: f64 = 100.0;
 /// Chat line length (7).
 pub const MAX_CHAT_CHARS: usize = 128;
+/// A silent player's sets are relayed to survivors lacking them after this long.
+pub const RELAY_AFTER: Duration = Duration::from_secs(1);
+/// Consumed sets kept per player for relaying.
+pub const RELAY_HISTORY: usize = 900;
+/// Sets offered per relay (the packet budget may trim it further).
+const RELAY_BATCH: usize = 64;
 /// Bound on queued local commands.
 pub const MAX_PENDING_COMMANDS: usize = 65_536;
 
@@ -342,6 +358,14 @@ struct Peer {
     bundle_due: Option<u32>,
     bundle_ready: Option<u32>,
     too_large_logged: bool,
+    /// After a drop: the agreed count of real sets (M).
+    cut_real: u32,
+    /// The drop cut still waits for real sets up to `cut_real` (by relay).
+    cut_pending: bool,
+    /// The last consumed sets, for relaying to a survivor that lacks them.
+    recent: VecDeque<Vec<u8>>,
+    /// The peer's last reported sets held per player.
+    held: Vec<(PlayerId, u32)>,
 }
 
 impl Peer {
@@ -364,6 +388,10 @@ impl Peer {
             bundle_due: None,
             bundle_ready: None,
             too_large_logged: false,
+            cut_real: 0,
+            cut_pending: false,
+            recent: VecDeque::new(),
+            held: Vec::new(),
         }
     }
 }
@@ -561,6 +589,11 @@ impl Lockstep {
     /// True if the last tick attempt was blocked.
     pub fn is_stalled(&self) -> bool {
         self.last_blocked
+    }
+
+    /// How many of a player's sets this peer holds (consumed plus buffered).
+    pub fn sets_held(&self, p: PlayerId) -> u32 {
+        self.peer(p).map_or(0, |x| x.pushed)
     }
 
     /// True once a player's drop has been applied here.
@@ -793,6 +826,7 @@ impl Lockstep {
             at: now,
             est: u.run.scene_time.saturating_add(rtt / 2 / TICK_MS),
         });
+        p.held = u.held.clone();
         let room = Room {
             commands: MAX_BUFFERED.saturating_sub(p.buffer.len()),
             hashes: hash_room,
@@ -816,6 +850,11 @@ impl Lockstep {
         }
         for h in inc.hashes {
             self.hashes.push(u.sender, h);
+        }
+        if let Some(r) = u.relay {
+            if !winding {
+                self.take_relay(u.sender, r);
+            }
         }
         for line in inc.chat {
             let text = sanitize_chat(&line.text);
@@ -851,8 +890,8 @@ impl Lockstep {
                 let mut stripped = false;
                 for c in cmds {
                     let ok = match &c {
-                        Command::Dropped { player, from } => {
-                            self.apply_drop(issuer, *player, from.0)
+                        Command::Dropped { player, from, sets } => {
+                            self.apply_drop(issuer, *player, from.0, *sets)
                         }
                         Command::Rejoined { player, at } => {
                             self.apply_rejoin(issuer, *player, at.0)
@@ -890,36 +929,43 @@ impl Lockstep {
             .map(|p| p.id)
     }
 
-    fn apply_drop(&mut self, issuer: PlayerId, player: PlayerId, from: u32) -> bool {
+    fn apply_drop(&mut self, issuer: PlayerId, player: PlayerId, from: u32, real: u32) -> bool {
         let scene = self.scene;
         let issuer_ok = issuer != player && !self.is_dropped(issuer);
         let Some(pi) = self.idx(player) else {
             self.log(format!("drop of unknown player {} stripped", player.0));
             return false;
         };
-        if !issuer_ok || self.is_dropped(player) || from == 0 || from > scene + MAX_LEAD {
+        if !issuer_ok
+            || self.is_dropped(player)
+            || from == 0
+            || real >= from
+            || from > scene + MAX_LEAD
+        {
             self.log(format!(
                 "invalid drop of player {} from tick {from} by player {} stripped",
                 player.0, issuer.0
             ));
             return false;
         }
-        let target = from - 1;
-        if target < scene {
+        let consumed_beyond = self
+            .peers
+            .get(pi)
+            .is_some_and(|p| scene > real && p.pushed > real);
+        if consumed_beyond {
             self.log(format!(
-                "unrecoverable desync: player {} dropped from tick {from} but tick {scene} already ran",
+                "unrecoverable desync: player {} cut at {real} sets but tick {scene} already ran",
                 player.0
             ));
         }
-        let keep = target.saturating_sub(scene) as usize;
         if let Some(p) = self.peers.get_mut(pi) {
-            if p.buffer.len() > keep {
+            if p.pushed > real {
+                let keep = real.saturating_sub(scene) as usize;
                 p.buffer.truncate(keep);
+                p.pushed = scene + keep as u32;
             }
-            while p.buffer.len() < keep {
-                p.buffer.push_back(Vec::new());
-            }
-            p.pushed = scene + keep as u32;
+            p.cut_real = real;
+            p.cut_pending = true;
             p.dropped_from = Some(from);
             p.rejoin_requested = false;
             p.reopen_at = None;
@@ -927,7 +973,123 @@ impl Lockstep {
             p.bundle_ready = None;
         }
         self.hashes.remove_source(player);
+        self.complete_cut(pi);
         true
+    }
+
+    /// Once a dropped player holds its M real sets, pads empties to `from - 1`.
+    fn complete_cut(&mut self, pi: usize) {
+        let Some(p) = self.peers.get_mut(pi) else {
+            return;
+        };
+        let Some(from) = p.dropped_from else { return };
+        if !p.cut_pending || p.pushed < p.cut_real {
+            return;
+        }
+        while p.pushed + 1 < from {
+            p.buffer.push_back(Vec::new());
+            p.pushed += 1;
+        }
+        p.cut_pending = false;
+    }
+
+    /// Takes relayed sets of a third player (see the module docs).
+    fn take_relay(&mut self, sender: PlayerId, r: crate::wire::Relay) {
+        if r.player == self.local || r.player == sender {
+            return;
+        }
+        let Some(pi) = self.idx(r.player) else { return };
+        let Some(p) = self.peers.get(pi) else { return };
+        let limit = match p.dropped_from {
+            Some(_) if p.cut_pending => p.cut_real,
+            Some(_) => return,
+            None if p.link.is_none() => return,
+            None => u32::MAX,
+        };
+        if r.first > p.pushed {
+            return;
+        }
+        let skip = (p.pushed - r.first) as usize;
+        let Some(new) = r.sets.get(skip..) else {
+            return;
+        };
+        if !new.iter().all(|s| decode_set(s).is_ok()) {
+            return;
+        }
+        for s in new {
+            let full = self
+                .peers
+                .get(pi)
+                .is_none_or(|p| p.pushed >= limit || p.buffer.len() >= MAX_BUFFERED);
+            if full {
+                break;
+            }
+            self.arrive(pi, s.clone());
+        }
+        if let Some(p) = self.peers.get_mut(pi) {
+            if p.dropped_from.is_none() {
+                let n = p.pushed;
+                if let Some(l) = p.link.as_mut() {
+                    l.skip_commands_to(n);
+                }
+            }
+        }
+        self.complete_cut(pi);
+    }
+
+    /// Sets of player `q` numbered `from..avail` that this peer still holds.
+    fn sets_from(&self, q: &Peer, from: u32, avail: u32) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut seq = from;
+        while seq < avail && out.len() < RELAY_BATCH {
+            let set = if seq >= self.scene {
+                q.buffer.get((seq - self.scene) as usize)
+            } else {
+                let back = (self.scene - seq) as usize;
+                q.recent
+                    .len()
+                    .checked_sub(back)
+                    .and_then(|i| q.recent.get(i))
+            };
+            match set {
+                Some(s) => out.push(s.clone()),
+                None => break,
+            }
+            seq += 1;
+        }
+        out
+    }
+
+    /// The relay to offer recipient `r`: the first player whose sets it lacks.
+    fn relay_offer(&self, r: &Peer, now: Instant) -> Option<crate::wire::Relay> {
+        if r.dropped_from.is_some() {
+            return None;
+        }
+        for q in &self.peers {
+            if q.id == r.id || q.id == self.local {
+                continue;
+            }
+            let avail = match q.dropped_from {
+                Some(_) => q.pushed.min(q.cut_real),
+                None if self.silence(q, now) >= RELAY_AFTER => q.pushed,
+                None => continue,
+            };
+            let Some(&(_, theirs)) = r.held.iter().find(|(p, _)| *p == q.id) else {
+                continue;
+            };
+            if theirs >= avail {
+                continue;
+            }
+            let sets = self.sets_from(q, theirs, avail);
+            if !sets.is_empty() {
+                return Some(crate::wire::Relay {
+                    player: q.id,
+                    first: theirs,
+                    sets,
+                });
+            }
+        }
+        None
     }
 
     fn apply_rejoin(&mut self, issuer: PlayerId, player: PlayerId, at: u32) -> bool {
@@ -954,6 +1116,7 @@ impl Lockstep {
                 p.pushed += 1;
             }
             p.dropped_from = None;
+            p.cut_pending = false;
             p.drop_issued = false;
             p.rejoin_requested = false;
             p.link = None;
@@ -1149,7 +1312,7 @@ impl Lockstep {
         let waiting: Vec<PlayerId> = self
             .peers
             .iter()
-            .filter(|p| p.buffer.is_empty() && p.dropped_from.is_none())
+            .filter(|p| p.buffer.is_empty() && (p.dropped_from.is_none() || p.cut_pending))
             .map(|p| p.id)
             .collect();
         if !waiting.is_empty() {
@@ -1157,9 +1320,16 @@ impl Lockstep {
             return Attempt::Blocked;
         }
         let mut sets: Vec<(PlayerId, Vec<u8>)> = Vec::with_capacity(self.peers.len());
+        let local = self.local;
         for p in self.peers.iter_mut().rev() {
             let set = p.buffer.pop_front().unwrap_or_default();
             p.pushed = p.pushed.max(t);
+            if p.id != local {
+                if p.recent.len() >= RELAY_HISTORY {
+                    p.recent.pop_front();
+                }
+                p.recent.push_back(set.clone());
+            }
             sets.push((p.id, set));
         }
         if self.record {
@@ -1232,7 +1402,7 @@ impl Lockstep {
                         self.chosen = s.max(1);
                     }
                 }
-                Command::Dropped { player, from } => {
+                Command::Dropped { player, from, .. } => {
                     if winding {
                         if let Some(i) = self.idx(player) {
                             if let Some(p) = self.peers.get_mut(i) {
@@ -1372,6 +1542,7 @@ impl Lockstep {
             p.last_heard = p.last_heard.or(Some(now));
             if let Some(f) = p.dropped_from {
                 p.link = None;
+                p.cut_pending = false;
                 removed.push(p.id);
                 while p.pushed + 1 < f {
                     p.buffer.push_back(Vec::new());
@@ -1531,6 +1702,19 @@ impl Lockstep {
             }
         }
         for player in issue {
+            // Wait until this peer holds every set any live survivor reports holding.
+            let own_held = self.peer(player).map_or(0, |p| p.pushed);
+            let max_held = self
+                .peers
+                .iter()
+                .filter(|s| s.id != player && s.id != self.local && s.dropped_from.is_none())
+                .filter(|s| self.silence(s, now) < self.drop_timeout)
+                .filter_map(|s| s.held.iter().find(|(q, _)| *q == player).map(|x| x.1))
+                .max()
+                .unwrap_or(0);
+            if own_held < max_held {
+                continue;
+            }
             let reported = self
                 .peers
                 .iter()
@@ -1538,10 +1722,11 @@ impl Lockstep {
                 .max()
                 .unwrap_or(0);
             let own_pushed = self.peers.get(self.local_idx()).map_or(0, |p| p.pushed);
-            let from = self.scene.max(own_pushed).max(reported) + DROP_MARGIN;
+            let from = self.scene.max(own_pushed).max(reported).max(own_held) + DROP_MARGIN;
             self.pending.push_back(Command::Dropped {
                 player,
                 from: Tick(from),
+                sets: own_held,
             });
             if let Some(i) = self.idx(player) {
                 if let Some(p) = self.peers.get_mut(i) {
@@ -1573,9 +1758,9 @@ impl Lockstep {
     // ------------------------------------------------------------ send
 
     fn flush(&mut self, now: Instant) {
-        let header = Header {
-            sender: self.local,
-            run: RunState {
+        let mut header = Header::new(
+            self.local,
+            RunState {
                 scene_time: self.scene,
                 speed: self.effective_speed(),
                 chosen: self.chosen,
@@ -1583,17 +1768,32 @@ impl Lockstep {
                 stalled: self.last_blocked,
                 capacity: self.capacity,
             },
-            pause: self.pause,
-        };
+            self.pause,
+        );
+        header.held = self.peers.iter().map(|p| (p.id, p.pushed)).collect();
+        let due: Vec<usize> = (0..self.peers.len())
+            .filter(|&i| {
+                self.peers
+                    .get(i)
+                    .and_then(|p| p.link.as_ref())
+                    .is_some_and(|l| l.due(now))
+            })
+            .collect();
+        let offers: Vec<_> = due
+            .iter()
+            .map(|&i| self.peers.get(i).and_then(|r| self.relay_offer(r, now)))
+            .collect();
         let mut logs = Vec::new();
-        for p in &mut self.peers {
+        for (i, offer) in due.into_iter().zip(offers) {
+            let Some(p) = self.peers.get_mut(i) else {
+                continue;
+            };
             let (Some(link), Some(to)) = (p.link.as_mut(), p.endpoint) else {
                 continue;
             };
-            if !link.due(now) {
-                continue;
-            }
-            let built = link.build(now, header);
+            let mut h = header.clone();
+            h.relay = offer;
+            let built = link.build(now, h);
             match built.error {
                 Some(BuildError::SetTooLarge { seq, size }) if !p.too_large_logged => {
                     p.too_large_logged = true;

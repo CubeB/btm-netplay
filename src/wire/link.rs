@@ -6,8 +6,9 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use super::codec::{
-    chat_size, encode_message, seal, set_size, update_header_size, ChatLine, Chunk, Message,
+    chat_size, encode_message, seal, set_size, update_header_size, ChatLine, Chunk, Message, Relay,
     RunState, SharedPause, Update, WireError, CHUNK_OVERHEAD, HASH_SIZE, MAX_PAYLOAD,
+    RELAY_OVERHEAD,
 };
 use crate::types::{Instant, PlayerId};
 
@@ -222,11 +223,27 @@ pub enum LinkNote {
 }
 
 /// The fields of an update that are not stream data.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Header {
     pub sender: PlayerId,
     pub run: RunState,
     pub pause: SharedPause,
+    /// Sets held per player (always sent).
+    pub held: Vec<(PlayerId, u32)>,
+    /// Sets offered for relay; the longest prefix that fits after the streams goes.
+    pub relay: Option<Relay>,
+}
+
+impl Header {
+    pub fn new(sender: PlayerId, run: RunState, pause: SharedPause) -> Self {
+        Header {
+            sender,
+            run,
+            pause,
+            held: Vec::new(),
+            relay: None,
+        }
+    }
 }
 
 /// Why `Link::build` could not produce a packet carrying the oldest set.
@@ -324,6 +341,15 @@ impl Link {
         self.commands.unacked()
     }
 
+    /// Marks the peer's sets before `next` as received (they came by relay), so
+    /// the direct copies are skipped and acknowledged.
+    pub fn skip_commands_to(&mut self, next: u32) {
+        if next > self.cmd_in {
+            self.cmd_in = next;
+            self.dirty = true;
+        }
+    }
+
     /// The next command sequence number expected from the peer.
     pub fn commands_expected(&self) -> u32 {
         self.cmd_in
@@ -371,10 +397,13 @@ impl Link {
                 ack: self.chat_in,
                 items: Vec::new(),
             },
+            held: header.held,
+            relay: None,
         };
         let mut budget = MAX_PAYLOAD
             .saturating_sub(update_header_size(&update))
-            .saturating_sub(3 * CHUNK_OVERHEAD);
+            .saturating_sub(3 * CHUNK_OVERHEAD)
+            .saturating_sub(RELAY_OVERHEAD);
         let mut error = None;
 
         for (i, set) in self.commands.iter().enumerate() {
@@ -405,6 +434,24 @@ impl Link {
             }
             budget -= size;
             update.chat.items.push(line.clone());
+        }
+        if let Some(offer) = header.relay {
+            let mut sets = Vec::new();
+            for s in offer.sets {
+                let size = set_size(&s);
+                if size > budget {
+                    break;
+                }
+                budget -= size;
+                sets.push(s);
+            }
+            if !sets.is_empty() {
+                update.relay = Some(Relay {
+                    player: offer.player,
+                    first: offer.first,
+                    sets,
+                });
+            }
         }
 
         let past_last = update

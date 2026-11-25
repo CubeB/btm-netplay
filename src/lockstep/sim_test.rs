@@ -103,6 +103,8 @@ struct Sim {
     rng: Rng,
     frame_ms: u64,
     commands: bool,
+    /// Directed links that deliver nothing.
+    blocked: Vec<(usize, usize)>,
 }
 
 fn ep(i: usize) -> Endpoint {
@@ -153,6 +155,7 @@ impl Sim {
             rng: Rng(seed),
             frame_ms: 16,
             commands: true,
+            blocked: Vec::new(),
         }
     }
 
@@ -195,6 +198,9 @@ impl Sim {
                     continue;
                 };
                 let p = (self.params)(i, to);
+                if self.blocked.contains(&(i, to)) {
+                    continue;
+                }
                 if self.rng.below(100) < p.loss_pct {
                     continue;
                 }
@@ -323,33 +329,31 @@ fn desync_is_detected_at_the_same_tick_by_every_peer() {
     assert_eq!(before, (0..3).map(|i| sim.scene(i)).collect::<Vec<_>>());
 }
 
-/// Lossy between survivors; the lost peer's last packets reach everyone (a lost
-/// peer whose final sets reach only some survivors is an inherent spec limitation).
-fn drop_params(lost: &'static [usize]) -> impl Fn(usize, usize) -> LinkParams {
-    move |a, b| {
-        if lost.contains(&a) || lost.contains(&b) {
+/// Drops a peer under loss on every link (its last sets reach survivors
+/// partially). Returns whether the survivors held different counts of its sets.
+fn drop_under_loss(seed: u64) -> bool {
+    // The lost peer's own sends are very lossy, so its final sets often reach
+    // only one survivor.
+    let mut sim = Sim::new(3, seed, |from, _| {
+        if from == 2 {
             LinkParams {
-                latency_ms: 10,
-                jitter_ms: 5,
-                loss_pct: 0,
-                dup_pct: 0,
+                loss_pct: 50,
+                ..BAD
             }
         } else {
             BAD
         }
-    }
-}
-
-#[test]
-fn lost_player_is_dropped_at_the_same_tick_everywhere() {
-    let mut sim = Sim::new(3, 5, drop_params(&[2]));
-    assert!(sim.run_until(20_000, |s| s.all_reach(&[0, 1, 2], 60)));
+    });
+    let kill_at = 60 + (seed as u32 * 7) % 40;
+    assert!(sim.run_until(20_000, |s| s.all_reach(&[0, 1, 2], kill_at)));
     sim.nodes[2].alive = false;
     let killed = sim.now;
+    sim.run_for(300); // in-flight datagrams land; relays have not started
+    let diverged = sim.nodes[0].ls.sets_held(PlayerId(2)) != sim.nodes[1].ls.sets_held(PlayerId(2));
     assert!(sim.run_until(30_000, |s| !s.left(0).is_empty() && !s.left(1).is_empty()));
     let (p, at) = sim.left(0)[0];
     assert_eq!(p, PlayerId(2));
-    assert_eq!(sim.left(1), vec![(p, at)]);
+    assert_eq!(sim.left(1), vec![(p, at)], "seed {seed}");
     assert!(sim.now - killed >= 10_000, "dropped before the timeout");
     // Only the designated declarer (player 0) issued it; everyone counted down.
     assert!(sim.nodes[0]
@@ -365,7 +369,6 @@ fn lost_player_is_dropped_at_the_same_tick_everywhere() {
             .events
             .iter()
             .any(|e| matches!(e, Event::DropCountdown { seconds: 1..=9, .. })));
-        // The engine saw the same drop command at the same tick.
         assert_eq!(sim.nodes[i].engine.controls.len(), 1);
     }
     assert_eq!(sim.nodes[0].engine.controls, sim.nodes[1].engine.controls);
@@ -373,26 +376,68 @@ fn lost_player_is_dropped_at_the_same_tick_everywhere() {
     sim.assert_same_history(&[0, 1], at.0 as usize + 100);
     sim.no_desync();
     assert!(sim.nodes[0].ls.is_dropped(PlayerId(2)));
+    diverged
+}
+
+#[test]
+fn lost_player_is_dropped_at_the_same_tick_everywhere_under_loss() {
+    let diverged = (0..12).filter(|&seed| drop_under_loss(seed)).count();
+    // The seeds must actually exercise partial delivery of the final sets.
+    assert!(
+        diverged >= 2,
+        "only {diverged} seeds left survivors unequal"
+    );
+}
+
+/// Only survivor 0 receives the lost peer's last sets; survivor 1 must get them
+/// by relay, and both must apply the same history.
+#[test]
+fn only_one_survivor_received_the_last_two_sets() {
+    let mut sim = Sim::new(3, 21, |_, _| LAN);
+    assert!(sim.run_until(20_000, |s| s.all_reach(&[0, 1, 2], 60)));
+    sim.blocked.push((2, 1));
+    let held = |s: &Sim, i: usize| s.nodes[i].ls.sets_held(PlayerId(2));
+    assert!(sim.run_until(5000, |s| held(s, 0) >= held(s, 1) + 2));
+    sim.nodes[2].alive = false;
+    sim.blocked.clear();
+    sim.run_for(300);
+    let (h0, h1) = (held(&sim, 0), held(&sim, 1));
+    assert!(h0 >= h1 + 2, "{h0} vs {h1}");
+    // Survivor 0 has already run past what survivor 1 holds.
+    assert!(sim.scene(0) > h1, "scene {} held {h1}", sim.scene(0));
+    assert!(sim.run_until(30_000, |s| !s.left(0).is_empty() && !s.left(1).is_empty()));
+    assert_eq!(sim.left(0), sim.left(1));
+    let at = sim.left(0)[0].1;
+    let Some((_, Command::Dropped { sets, .. })) = sim.nodes[1].engine.controls.first().cloned()
+    else {
+        panic!("no drop command")
+    };
+    assert_eq!(sets, h0, "the cut keeps every real set");
+    assert!(sim.run_until(30_000, |s| s.all_reach(&[0, 1], at.0 + 100)));
+    sim.assert_same_history(&[0, 1], at.0 as usize + 100);
+    sim.no_desync();
 }
 
 /// Deviation from 5.5: the two lowest peers lost together no longer hang the game.
 #[test]
-fn two_lowest_lost_together_are_both_dropped() {
-    let mut sim = Sim::new(4, 6, drop_params(&[0, 1]));
-    assert!(sim.run_until(20_000, |s| s.all_reach(&[0, 1, 2, 3], 60)));
-    sim.nodes[0].alive = false;
-    sim.nodes[1].alive = false;
-    assert!(sim.run_until(60_000, |s| s.left(2).len() == 2 && s.left(3).len() == 2));
-    assert_eq!(sim.left(2), sim.left(3));
-    let last = sim.left(2).iter().map(|x| x.1 .0).max().unwrap();
-    assert!(sim.run_until(30_000, |s| s.all_reach(&[2, 3], last + 50)));
-    sim.assert_same_history(&[2, 3], last as usize + 50);
-    sim.no_desync();
+fn two_lowest_lost_together_are_both_dropped_under_loss() {
+    for seed in 0..4 {
+        let mut sim = Sim::new(4, 100 + seed, |_, _| BAD);
+        assert!(sim.run_until(20_000, |s| s.all_reach(&[0, 1, 2, 3], 60)));
+        sim.nodes[0].alive = false;
+        sim.nodes[1].alive = false;
+        assert!(sim.run_until(60_000, |s| s.left(2).len() == 2 && s.left(3).len() == 2));
+        assert_eq!(sim.left(2), sim.left(3), "seed {seed}");
+        let last = sim.left(2).iter().map(|x| x.1 .0).max().unwrap();
+        assert!(sim.run_until(30_000, |s| s.all_reach(&[2, 3], last + 50)));
+        sim.assert_same_history(&[2, 3], last as usize + 50);
+        sim.no_desync();
+    }
 }
 
 #[test]
 fn rejoin_catches_up_and_matches_hashes() {
-    let mut sim = Sim::new(3, 7, drop_params(&[2]));
+    let mut sim = Sim::new(3, 7, |_, _| BAD);
     assert!(sim.run_until(20_000, |s| s.all_reach(&[0, 1, 2], 60)));
     sim.nodes[2].alive = false;
     assert!(sim.run_until(30_000, |s| !s.left(0).is_empty() && !s.left(1).is_empty()));
@@ -466,7 +511,7 @@ fn rejoin_catches_up_and_matches_hashes() {
 
 #[test]
 fn rejoined_peer_desync_is_still_detected() {
-    let mut sim = Sim::new(2, 8, drop_params(&[1]));
+    let mut sim = Sim::new(2, 8, |_, _| BAD);
     assert!(sim.run_until(20_000, |s| s.all_reach(&[0, 1], 40)));
     sim.nodes[1].alive = false;
     assert!(sim.run_until(30_000, |s| !s.left(0).is_empty()));

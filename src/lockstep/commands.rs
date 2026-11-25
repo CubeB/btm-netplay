@@ -27,8 +27,14 @@ pub enum Command {
     Game(Vec<u8>),
     /// Game speed change, per mille (1.8). Takes effect after the tick it runs on.
     Speed(u16),
-    /// "Player dropped": from `from` on the player contributes empty sets (5.3).
-    Dropped { player: PlayerId, from: Tick },
+    /// "Player dropped" (5.3): the player's stream is cut to exactly `from - 1`
+    /// sets, of which the first `sets` are its real sets and the rest empty; from
+    /// `from` on it contributes empty sets. `sets` is a deviation (see lockstep docs).
+    Dropped {
+        player: PlayerId,
+        from: Tick,
+        sets: u32,
+    },
     /// "Player rejoined": the player's stream reopens at `at` (5.6).
     Rejoined { player: PlayerId, at: Tick },
 }
@@ -51,9 +57,10 @@ impl Command {
         match self {
             Command::Game(b) => 1 + varint_len(b.len() as u64) + b.len(),
             Command::Speed(s) => 1 + varint_len(u64::from(*s)),
-            Command::Dropped { from: t, .. } | Command::Rejoined { at: t, .. } => {
-                2 + varint_len(u64::from(t.0))
+            Command::Dropped { from, sets, .. } => {
+                2 + varint_len(u64::from(from.0)) + varint_len(u64::from(*sets))
             }
+            Command::Rejoined { at, .. } => 2 + varint_len(u64::from(at.0)),
         }
     }
 
@@ -67,10 +74,11 @@ impl Command {
                 w.u8(TAG_SPEED);
                 w.varint(u64::from(*s));
             }
-            Command::Dropped { player, from } => {
+            Command::Dropped { player, from, sets } => {
                 w.u8(TAG_DROPPED);
                 w.u8(player.0);
                 w.varint(u64::from(from.0));
+                w.varint(u64::from(*sets));
             }
             Command::Rejoined { player, at } => {
                 w.u8(TAG_REJOINED);
@@ -105,9 +113,14 @@ pub fn decode_set(bytes: &[u8]) -> Result<Vec<Command>, SetError> {
                 }
                 let t = Tick(r.u32v("tick").map_err(SetError)?);
                 if tag == TAG_DROPPED {
+                    let sets = r.u32v("real sets").map_err(SetError)?;
+                    if sets >= t.0 {
+                        return Err(SetError(WireError::BadValue("real sets")));
+                    }
                     Command::Dropped {
                         player: PlayerId(p),
                         from: t,
+                        sets,
                     }
                 } else {
                     Command::Rejoined {
@@ -155,6 +168,7 @@ mod tests {
             Command::Dropped {
                 player: PlayerId(4),
                 from: Tick(1234),
+                sets: 1200,
             },
             Command::Rejoined {
                 player: PlayerId(9),
