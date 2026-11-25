@@ -513,3 +513,31 @@ fn a_guest_joins_while_its_stun_probe_is_still_out() {
         guest.log
     );
 }
+
+/// A typed host name is looked up off the caller's thread: `Node::new` returns at once and
+/// a later pump joins.
+#[test]
+fn a_guest_joins_by_host_name() {
+    let wait = Duration::from_secs(30);
+    let mut host = Peer::new("host", node(config("Host", wait), Role::Host, false), 1);
+    let port = host.node.local_port(Socket::Discovery).unwrap();
+    let target = format!("localhost:{port}");
+    let mut guest = Peer::new(
+        "guest",
+        node(config("Guest", wait), Role::Join(target), false),
+        2,
+    );
+    assert_eq!(guest.node.phase(), Phase::Traversal);
+    let t0 = StdInstant::now();
+    while guest.node.guest_lobby().and_then(|g| g.my_seat()).is_none() {
+        assert!(t0.elapsed() < Duration::from_secs(20), "{:?}", guest.log);
+        host.pump();
+        guest.pump();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        guest.log.iter().any(|l| l == "Looking up localhost..."),
+        "{:?}",
+        guest.log
+    );
+}

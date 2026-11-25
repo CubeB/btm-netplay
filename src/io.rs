@@ -17,7 +17,9 @@
 //!
 //! Drive it with [`Node::pump`] (read every pending datagram, route each by its first
 //! bytes, poll every state machine, send what they produced) and [`Node::wait`] (sleep
-//! until the earliest deadline, at most 5 ms). No threads.
+//! until the earliest deadline, at most 5 ms). The only threads are short-lived name
+//! lookups ([`Lookup`]): a typed host name and the default STUN servers are resolved
+//! off the caller's thread, and the answer is picked up by a later pump.
 //!
 //! Routing: on the discovery socket a datagram that passes the STUN shape test goes to the
 //! traversal first; the fixed LAN probe goes to the host lobby; everything else is lobby
@@ -74,16 +76,18 @@
 //! same trait and is passed to [`Node::with_transport`].
 
 pub mod load;
+pub mod lookup;
 pub mod rng;
 pub mod toy;
 pub mod transport;
 
 use std::collections::HashSet;
 use std::fmt;
-use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
 pub use load::{LoadEvent, LoadHandshake, LoadTimeout};
+pub use lookup::Lookup;
 pub use rng::Rng;
 pub use transport::{Datagram, Socket, Transport, TransportError, TransportEvent, UdpTransport};
 
@@ -275,6 +279,8 @@ pub enum Ended {
     LoadTimedOut(LoadTimeout),
     /// The simulations diverged (4.3). Fatal.
     Desync(Box<Desync>),
+    /// The typed host name did not resolve to an IPv4 address.
+    HostNotFound(String),
     /// Anything else that stops the game.
     Failed(String),
     /// The local player left.
@@ -286,6 +292,7 @@ impl fmt::Display for Ended {
         match self {
             Self::Join(e) => write!(f, "{e}"),
             Self::LoadTimedOut(t) => write!(f, "{t}"),
+            Self::HostNotFound(s) => write!(f, "Cannot find the computer called {s}"),
             Self::Desync(d) => write!(f, "{}", d.report(None)),
             Self::Failed(s) => write!(f, "{s}"),
             Self::Left => write!(f, "You left the game"),
@@ -492,9 +499,28 @@ enum JoinVia {
     Relay { relay: Endpoint, room: RoomId },
 }
 
+/// What the user typed to join.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Typed {
+    Via(JoinVia),
+    /// A host name, to look up off the caller's thread.
+    Name {
+        host: String,
+        port: u16,
+    },
+}
+
+/// A name lookup in flight, and what it is for.
+struct NameLookup {
+    lookup: Lookup,
+    host: String,
+    port: u16,
+}
+
 /// A game list.
 struct Browser {
     prober: Prober,
+    targets: Vec<Endpoint>,
     heard: HeardAnnouncements<u64>,
     games: Vec<(u64, ListedGame)>,
     started: Instant,
@@ -568,6 +594,10 @@ pub struct Node<T: Transport = UdpTransport> {
     /// A returning player: the catch-up to fast-forward through once loaded.
     pending_rejoin: Option<(lockstep::Bundle, Tick)>,
     rejoin_status: Option<String>,
+    /// The default STUN servers being looked up.
+    stun_lookup: Option<Lookup>,
+    /// The typed host name being looked up (join or game list).
+    name_lookup: Option<NameLookup>,
 }
 
 impl Node<UdpTransport> {
@@ -630,31 +660,19 @@ impl<T: Transport> Node<T> {
             speaking: Vec::new(),
             pending_rejoin: None,
             rejoin_status: None,
+            stun_lookup: None,
+            name_lookup: None,
         };
         match role {
             Role::Browse(target) => node.open_browser(now, target.as_deref())?,
-            Role::Join(text) => {
-                let via = parse_join(&text, node.cfg.lan_port)?;
-                node.join = Some(via);
-                match via {
-                    JoinVia::Relay { relay, room } => {
-                        let nonce = node.rng.bytes::<8>();
-                        node.transport
-                            .open_relay(RelayLink::guest(relay, room, nonce, now))?;
-                        node.events.push(Event::Status(format!(
-                            "Connecting to the relay at {relay}..."
-                        )));
-                    }
-                    JoinVia::Direct { host, .. } => {
-                        node.events
-                            .push(Event::Status(format!("Connecting to {host}...")));
-                        // STUN and the probes run in parallel (2.6): the lobby opens now
-                        // and gets this machine's outside addresses once STUN answers.
-                        node.start_traversal(now);
-                        node.open_guest(now)?;
-                    }
+            Role::Join(text) => match parse_join(&text, node.cfg.lan_port)? {
+                Typed::Via(via) => node.begin_join(now, via)?,
+                Typed::Name { host, port } => {
+                    node.events
+                        .push(Event::Status(format!("Looking up {host}...")));
+                    node.lookup_name(host, port)?;
                 }
-            }
+            },
             Role::Host => {
                 if !node.start_traversal(now) {
                     node.open_host(now)?;
@@ -966,21 +984,130 @@ impl<T: Transport> Node<T> {
 
     // ------------------------------------------------------------------ phases
 
-    /// Start STUN if configured. Returns whether traversal is now running.
+    /// Start joining the host the user named.
+    fn begin_join(&mut self, now: Instant, via: JoinVia) -> Result<(), NodeError> {
+        self.join = Some(via);
+        match via {
+            JoinVia::Relay { relay, room } => {
+                let nonce = self.rng.bytes::<8>();
+                self.transport
+                    .open_relay(RelayLink::guest(relay, room, nonce, now))?;
+                self.events.push(Event::Status(format!(
+                    "Connecting to the relay at {relay}..."
+                )));
+            }
+            JoinVia::Direct { host, .. } => {
+                self.events
+                    .push(Event::Status(format!("Connecting to {host}...")));
+                // STUN and the probes run in parallel (2.6): the lobby opens now and gets
+                // this machine's outside addresses once STUN answers.
+                self.start_traversal(now);
+                self.open_guest(now)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Look a typed host name up off this thread; a later pump picks the answer up. If no
+    /// thread can be started, look it up here.
+    fn lookup_name(&mut self, host: String, port: u16) -> Result<(), NodeError> {
+        match Lookup::spawn(vec![(host.clone(), port)]) {
+            Ok(lookup) => {
+                self.name_lookup = Some(NameLookup { lookup, host, port });
+                Ok(())
+            }
+            Err(_) => match lookup::resolve_v4(&host, port) {
+                Some(ep) => {
+                    let now = self.clock.now();
+                    self.on_name_found(now, &host, Some(ep));
+                    Ok(())
+                }
+                None => Err(NodeError::HostNotFound(host)),
+            },
+        }
+    }
+
+    /// Answers of the name lookups in flight.
+    fn poll_lookups(&mut self, now: Instant) {
+        if let Some(found) = self.stun_lookup.as_mut().and_then(Lookup::poll) {
+            self.stun_lookup = None;
+            let servers: Vec<Endpoint> = found.into_iter().flatten().collect();
+            if !self.begin_traversal(now, &servers) {
+                self.after_traversal(now);
+            }
+        }
+        if let Some(found) = self.name_lookup.as_mut().and_then(|n| n.lookup.poll()) {
+            if let Some(n) = self.name_lookup.take() {
+                let ep = found
+                    .first()
+                    .copied()
+                    .flatten()
+                    .map(|e| SocketAddrV4::new(*e.ip(), n.port));
+                self.on_name_found(now, &n.host, ep);
+            }
+        }
+    }
+
+    /// A typed host name resolved (or did not).
+    fn on_name_found(&mut self, now: Instant, host: &str, ep: Option<Endpoint>) {
+        match (&mut self.lobby, ep) {
+            (Lobby::Browse(b), Some(ep)) => {
+                if !b.targets.contains(&ep) {
+                    b.targets.push(ep);
+                    b.prober.set_targets(&b.targets);
+                }
+            }
+            (Lobby::Browse(_), None) => self.events.push(Event::Notice(format!(
+                "Cannot find the computer called {host}"
+            ))),
+            (_, Some(ep)) => {
+                let via = JoinVia::Direct {
+                    host: ep,
+                    via_code: false,
+                };
+                if let Err(e) = self.begin_join(now, via) {
+                    self.end(Ended::Failed(e.to_string()));
+                }
+            }
+            (_, None) => self.end(Ended::HostNotFound(host.to_owned())),
+        }
+    }
+
+    /// Start STUN if configured. Returns whether traversal is now running, or waiting for
+    /// the default servers' names to be looked up (off this thread).
     fn start_traversal(&mut self, now: Instant) -> bool {
-        let servers = match &self.cfg.stun {
-            Stun::Off => return false,
-            Stun::Servers(s) => s.clone(),
-            Stun::Default => resolve_default_servers(),
-        };
+        if self.cfg.stun == Stun::Off {
+            return false;
+        }
         self.events.push(Event::Status(
             "Finding this computer's internet address...".to_owned(),
         ));
+        let servers = match &self.cfg.stun {
+            Stun::Off => return false,
+            Stun::Servers(s) => s.clone(),
+            Stun::Default => {
+                let names = stun::DEFAULT_SERVERS
+                    .iter()
+                    .map(|(h, p)| ((*h).to_owned(), *p))
+                    .collect();
+                match Lookup::spawn(names) {
+                    Ok(l) => {
+                        self.stun_lookup = Some(l);
+                        return true;
+                    }
+                    Err(_) => resolve_default_servers(),
+                }
+            }
+        };
+        self.begin_traversal(now, &servers)
+    }
+
+    /// Start STUN with these servers. Returns whether traversal is now running.
+    fn begin_traversal(&mut self, now: Instant, servers: &[Endpoint]) -> bool {
         let rng = &mut self.rng;
-        match Traversal::start(&servers, now, &mut || rng.bytes::<12>()) {
+        match Traversal::start(servers, now, &mut || rng.bytes::<12>()) {
             Ok(t) => {
                 self.traversal = Some(t);
-                self.phase = Phase::Traversal;
                 true
             }
             Err(f) => {
@@ -1087,14 +1214,17 @@ impl<T: Transport> Node<T> {
             lan::loopback_target(self.cfg.lan_port),
         ];
         if let Some(t) = target {
-            if let JoinVia::Direct { host, .. } = parse_join(t, self.cfg.lan_port)? {
-                targets.push(host);
+            match parse_join(t, self.cfg.lan_port)? {
+                Typed::Via(JoinVia::Direct { host, .. }) => targets.push(host),
+                Typed::Via(JoinVia::Relay { .. }) => {}
+                Typed::Name { host, port } => self.lookup_name(host, port)?,
             }
         }
         let mut prober = Prober::new();
         prober.set_targets(&targets);
         self.lobby = Lobby::Browse(Box::new(Browser {
             prober,
+            targets,
             heard: HeardAnnouncements::new(),
             games: Vec::new(),
             started: now,
@@ -1629,6 +1759,7 @@ impl<T: Transport> Node<T> {
     // ------------------------------------------------------------------ poll
 
     fn poll_all(&mut self, now: Instant, engine: &mut impl Engine) {
+        self.poll_lookups(now);
         for e in self.transport.poll(now) {
             self.on_transport(now, e);
         }
@@ -2250,27 +2381,16 @@ impl Browser {
 }
 
 /// Resolve the default STUN servers to IPv4, skipping the ones that do not resolve.
-/// This blocks for the lookups (the spec does them off the UI thread).
+/// This blocks for the lookups; a [`Node`] does them on a [`Lookup`] thread instead.
 pub fn resolve_default_servers() -> Vec<Endpoint> {
-    let mut out = Vec::new();
-    for (host, port) in stun::DEFAULT_SERVERS {
-        if let Ok(addrs) = (host, port).to_socket_addrs() {
-            if let Some(v4) = addrs
-                .filter_map(|a| match a {
-                    std::net::SocketAddr::V4(v) => Some(v),
-                    std::net::SocketAddr::V6(_) => None,
-                })
-                .next()
-            {
-                out.push(v4);
-            }
-        }
-    }
-    out
+    stun::DEFAULT_SERVERS
+        .iter()
+        .filter_map(|(host, port)| lookup::resolve_v4(host, *port))
+        .collect()
 }
 
-/// How to reach the host, from what the user typed.
-fn parse_join(text: &str, default_port: u16) -> Result<JoinVia, NodeError> {
+/// How to reach the host, from what the user typed. Host names are not looked up here.
+fn parse_join(text: &str, default_port: u16) -> Result<Typed, NodeError> {
     let t = text.trim();
     // A relay code first: it is longer than any address.
     if let Ok(AnyInvite::Relay(inv)) = relay_code::decode_any(t) {
@@ -2278,39 +2398,22 @@ fn parse_join(text: &str, default_port: u16) -> Result<JoinVia, NodeError> {
             RelayRef::Endpoint(e) => e,
             RelayRef::Index(_) => return Err(NodeError::UnknownRelay),
         };
-        return Ok(JoinVia::Relay {
+        return Ok(Typed::Via(JoinVia::Relay {
             relay,
             room: inv.room,
-        });
+        }));
     }
     match lan::parse_target(t, default_port) {
-        Ok(TypedTarget::Ipv4(host)) => Ok(JoinVia::Direct {
+        Ok(TypedTarget::Ipv4(host)) => Ok(Typed::Via(JoinVia::Direct {
             host,
             via_code: false,
-        }),
-        Ok(TypedTarget::Code(host)) => Ok(JoinVia::Direct {
+        })),
+        Ok(TypedTarget::Code(host)) => Ok(Typed::Via(JoinVia::Direct {
             host,
             via_code: true,
-        }),
+        })),
         Ok(TypedTarget::Ipv6(_)) => Err(NodeError::Ipv6),
-        Ok(TypedTarget::Name { host, port }) => {
-            let found = (host.as_str(), port)
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut it| {
-                    it.find_map(|a| match a {
-                        std::net::SocketAddr::V4(v) => Some(v),
-                        std::net::SocketAddr::V6(_) => None,
-                    })
-                });
-            match found {
-                Some(v4) => Ok(JoinVia::Direct {
-                    host: SocketAddrV4::new(*v4.ip(), port),
-                    via_code: false,
-                }),
-                None => Err(NodeError::HostNotFound(host)),
-            }
-        }
+        Ok(TypedTarget::Name { host, port }) => Ok(Typed::Name { host, port }),
         Err(_) => Err(NodeError::InvalidAddress(t.to_owned())),
     }
 }
@@ -2325,26 +2428,26 @@ mod tests {
         let lan = 1338;
         assert_eq!(
             parse_join("10.0.0.2:5000", lan).unwrap(),
-            JoinVia::Direct {
+            Typed::Via(JoinVia::Direct {
                 host: "10.0.0.2:5000".parse().unwrap(),
                 via_code: false
-            }
+            })
         );
         assert_eq!(
             parse_join("10.0.0.2", lan).unwrap(),
-            JoinVia::Direct {
+            Typed::Via(JoinVia::Direct {
                 host: "10.0.0.2:1338".parse().unwrap(),
                 via_code: false
-            }
+            })
         );
         let ep: Endpoint = "81.2.69.160:40000".parse().unwrap();
         let code = invite::encode(ep).unwrap();
         assert_eq!(
             parse_join(&code, lan).unwrap(),
-            JoinVia::Direct {
+            Typed::Via(JoinVia::Direct {
                 host: ep,
                 via_code: true
-            }
+            })
         );
         let inv = RelayInvite {
             relay: RelayRef::Endpoint("81.2.69.161:3479".parse().unwrap()),
@@ -2353,16 +2456,24 @@ mod tests {
         let code = relay_code::encode(&inv).unwrap();
         assert_eq!(
             parse_join(&code, lan).unwrap(),
-            JoinVia::Relay {
+            Typed::Via(JoinVia::Relay {
                 relay: "81.2.69.161:3479".parse().unwrap(),
                 room: 0x1234_5678_9abc
-            }
+            })
         );
         assert!(matches!(
             parse_join("not an address!", lan),
             Err(NodeError::InvalidAddress(_))
         ));
         assert!(matches!(parse_join("::1", lan), Err(NodeError::Ipv6)));
+        // Names are looked up later, off the caller's thread.
+        assert_eq!(
+            parse_join("game-host.example:4000", lan).unwrap(),
+            Typed::Name {
+                host: "game-host.example".to_owned(),
+                port: 4000
+            }
+        );
     }
 
     #[test]
